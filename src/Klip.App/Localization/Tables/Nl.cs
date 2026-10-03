@@ -111,6 +111,8 @@ internal static class Nl
         ["SectionAppHotkeys"] = "Klip-sneltoetsen",
         ["OpenHistoryHotkey"] = "Geschiedenis openen",
         ["NewCaptureHotkey"] = "Nieuwe opname",
+        ["CaptureRectangleHotkey"] = "Direct rechthoek vastleggen",
+        ["CaptureGifHotkey"] = "Direct GIF opnemen",
         ["HotkeyHint"] = "Klik in het veld en druk op de combinatie",
         ["SectionGeneral"] = "Algemeen",
         ["StartWithWindows"] = "Starten met Windows",

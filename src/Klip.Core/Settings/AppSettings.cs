@@ -13,6 +13,10 @@ public sealed class AppSettings
     public string HotkeyHistory { get; set; } = "Ctrl+Shift+V";
     public string HotkeyCapture { get; set; } = "Ctrl+Shift+S";
 
+    // direct-mode capture shortcuts: open the overlay already in that mode (empty = off)
+    public string HotkeyCaptureRectangle { get; set; } = "Alt+PrintScreen";
+    public string HotkeyCaptureGif { get; set; } = "Ctrl+PrintScreen";
+
     // retention: pinned and favorites never get evicted
     public int RetentionMaxItems { get; set; } = 10_000;
     public int RetentionMaxAgeDays { get; set; } = 0;          // 0 = no limit

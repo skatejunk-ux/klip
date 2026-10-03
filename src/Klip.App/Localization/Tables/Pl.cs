@@ -111,6 +111,8 @@ internal static class Pl
         ["SectionAppHotkeys"] = "Skróty Klip",
         ["OpenHistoryHotkey"] = "Otwórz historię",
         ["NewCaptureHotkey"] = "Nowe przechwytywanie",
+        ["CaptureRectangleHotkey"] = "Bezpośrednie przechwytywanie prostokąta",
+        ["CaptureGifHotkey"] = "Bezpośrednie nagrywanie GIF",
         ["HotkeyHint"] = "Kliknij pole i naciśnij kombinację",
         ["SectionGeneral"] = "Ogólne",
         ["StartWithWindows"] = "Uruchamiaj z systemem Windows",

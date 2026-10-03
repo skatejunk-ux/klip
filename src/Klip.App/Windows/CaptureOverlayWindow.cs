@@ -45,6 +45,13 @@ public enum CaptureDelay
 public sealed class CaptureOverlayWindow : Window
 {
     private static CaptureMode _mode = CaptureMode.Rectangle; // shared across monitors
+
+    /// <summary>Mode the next overlay opens in (shared across monitors and sessions).</summary>
+    public static CaptureMode CurrentMode
+    {
+        get => _mode;
+        set => _mode = value;
+    }
     private static CaptureDelay _delay = CaptureDelay.None;    // same deal
     private Button? _delayButton;
     private TextBlock? _countdownLabel;

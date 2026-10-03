@@ -111,6 +111,8 @@ internal static class Es
         ["SectionAppHotkeys"] = "Atajos de Klip",
         ["OpenHistoryHotkey"] = "Abrir historial",
         ["NewCaptureHotkey"] = "Nueva captura",
+        ["CaptureRectangleHotkey"] = "Captura rectangular directa",
+        ["CaptureGifHotkey"] = "Grabar GIF directamente",
         ["HotkeyHint"] = "Haz clic en el campo y pulsa la combinación",
         ["SectionGeneral"] = "General",
         ["StartWithWindows"] = "Iniciar con Windows",

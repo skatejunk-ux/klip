@@ -111,6 +111,8 @@ internal static class Tr
         ["SectionAppHotkeys"] = "Klip kısayolları",
         ["OpenHistoryHotkey"] = "Geçmişi aç",
         ["NewCaptureHotkey"] = "Yeni yakalama",
+        ["CaptureRectangleHotkey"] = "Doğrudan dikdörtgen yakalama",
+        ["CaptureGifHotkey"] = "Doğrudan GIF kaydı",
         ["HotkeyHint"] = "Alana tıklayın ve tuş bileşimine basın",
         ["SectionGeneral"] = "Genel",
         ["StartWithWindows"] = "Windows ile başlat",

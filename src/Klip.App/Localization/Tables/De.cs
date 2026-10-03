@@ -111,6 +111,8 @@ internal static class De
         ["SectionAppHotkeys"] = "Klip-Tastenkombinationen",
         ["OpenHistoryHotkey"] = "Verlauf öffnen",
         ["NewCaptureHotkey"] = "Neue Aufnahme",
+        ["CaptureRectangleHotkey"] = "Direkte Rechteckaufnahme",
+        ["CaptureGifHotkey"] = "Direkte GIF-Aufnahme",
         ["HotkeyHint"] = "Klicken Sie in das Feld und drücken Sie die Kombination",
         ["SectionGeneral"] = "Allgemein",
         ["StartWithWindows"] = "Mit Windows starten",

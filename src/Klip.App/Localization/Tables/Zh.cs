@@ -111,6 +111,8 @@ internal static class Zh
         ["SectionAppHotkeys"] = "Klip 快捷键",
         ["OpenHistoryHotkey"] = "打开历史记录",
         ["NewCaptureHotkey"] = "新建截图",
+        ["CaptureRectangleHotkey"] = "直接矩形截图",
+        ["CaptureGifHotkey"] = "直接录制 GIF",
         ["HotkeyHint"] = "单击输入框并按下组合键",
         ["SectionGeneral"] = "常规",
         ["StartWithWindows"] = "随 Windows 启动",

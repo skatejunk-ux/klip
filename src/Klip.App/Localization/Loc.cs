@@ -277,6 +277,8 @@ public static class Loc
     public static string SectionAppHotkeys => Get(nameof(SectionAppHotkeys));
     public static string OpenHistoryHotkey => Get(nameof(OpenHistoryHotkey));
     public static string NewCaptureHotkey => Get(nameof(NewCaptureHotkey));
+    public static string CaptureRectangleHotkey => Get(nameof(CaptureRectangleHotkey));
+    public static string CaptureGifHotkey => Get(nameof(CaptureGifHotkey));
     public static string HotkeyHint => Get(nameof(HotkeyHint));
     public static string HotkeyPressKeys => Get(nameof(HotkeyPressKeys));
     public static string SectionFlyoutShortcuts => Get(nameof(SectionFlyoutShortcuts));
@@ -630,6 +632,8 @@ public static class Loc
         [nameof(SectionAppHotkeys)] = "Atalhos do Klip",
         [nameof(OpenHistoryHotkey)] = "Abrir histórico",
         [nameof(NewCaptureHotkey)] = "Nova captura",
+        [nameof(CaptureRectangleHotkey)] = "Captura retangular direta",
+        [nameof(CaptureGifHotkey)] = "Gravar GIF direto",
         [nameof(HotkeyHint)] = "Clique nas teclas e pressione a nova combinação",
         [nameof(HotkeyPressKeys)] = "pressione as teclas",
         [nameof(SectionFlyoutShortcuts)] = "Atalhos do painel (Win+V)",
@@ -975,6 +979,8 @@ public static class Loc
         [nameof(SectionAppHotkeys)] = "Klip shortcuts",
         [nameof(OpenHistoryHotkey)] = "Open history",
         [nameof(NewCaptureHotkey)] = "New capture",
+        [nameof(CaptureRectangleHotkey)] = "Direct rectangle capture",
+        [nameof(CaptureGifHotkey)] = "Direct GIF recording",
         [nameof(HotkeyHint)] = "Click the keys and press the new combination",
         [nameof(HotkeyPressKeys)] = "press the keys",
         [nameof(SectionFlyoutShortcuts)] = "Panel shortcuts (Win+V)",

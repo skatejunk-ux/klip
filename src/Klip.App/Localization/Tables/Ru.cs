@@ -111,6 +111,8 @@ internal static class Ru
         ["SectionAppHotkeys"] = "Сочетания Klip",
         ["OpenHistoryHotkey"] = "Открыть историю",
         ["NewCaptureHotkey"] = "Новый снимок",
+        ["CaptureRectangleHotkey"] = "Прямоугольный снимок сразу",
+        ["CaptureGifHotkey"] = "Запись GIF сразу",
         ["HotkeyHint"] = "Щёлкните поле и нажмите сочетание клавиш",
         ["SectionGeneral"] = "Общие",
         ["StartWithWindows"] = "Запускать вместе с Windows",

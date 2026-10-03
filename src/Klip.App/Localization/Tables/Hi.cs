@@ -111,6 +111,8 @@ internal static class Hi
         ["SectionAppHotkeys"] = "Klip शॉर्टकट",
         ["OpenHistoryHotkey"] = "इतिहास खोलें",
         ["NewCaptureHotkey"] = "नया कैप्चर",
+        ["CaptureRectangleHotkey"] = "सीधा आयताकार कैप्चर",
+        ["CaptureGifHotkey"] = "सीधी GIF रिकॉर्डिंग",
         ["HotkeyHint"] = "फ़ील्ड पर क्लिक करें और कुंजी संयोजन दबाएँ",
         ["SectionGeneral"] = "सामान्य",
         ["StartWithWindows"] = "Windows के साथ शुरू करें",

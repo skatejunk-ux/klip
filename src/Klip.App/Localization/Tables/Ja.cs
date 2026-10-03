@@ -111,6 +111,8 @@ internal static class Ja
         ["SectionAppHotkeys"] = "Klip のショートカット",
         ["OpenHistoryHotkey"] = "履歴を開く",
         ["NewCaptureHotkey"] = "新しいキャプチャ",
+        ["CaptureRectangleHotkey"] = "四角形で直接キャプチャ",
+        ["CaptureGifHotkey"] = "GIF を直接録画",
         ["HotkeyHint"] = "フィールドをクリックしてキーの組み合わせを押してください",
         ["SectionGeneral"] = "全般",
         ["StartWithWindows"] = "Windows と同時に起動",

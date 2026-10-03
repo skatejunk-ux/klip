@@ -111,6 +111,8 @@ internal static class It
         ["SectionAppHotkeys"] = "Scorciatoie di Klip",
         ["OpenHistoryHotkey"] = "Apri cronologia",
         ["NewCaptureHotkey"] = "Nuova cattura",
+        ["CaptureRectangleHotkey"] = "Cattura rettangolare diretta",
+        ["CaptureGifHotkey"] = "Registrazione GIF diretta",
         ["HotkeyHint"] = "Fai clic sul campo e premi la combinazione",
         ["SectionGeneral"] = "Generale",
         ["StartWithWindows"] = "Avvia con Windows",

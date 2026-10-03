@@ -111,6 +111,8 @@ internal static class Ar
         ["SectionAppHotkeys"] = "اختصارات Klip",
         ["OpenHistoryHotkey"] = "فتح السجل",
         ["NewCaptureHotkey"] = "التقاط جديد",
+        ["CaptureRectangleHotkey"] = "التقاط مستطيل مباشر",
+        ["CaptureGifHotkey"] = "تسجيل GIF مباشر",
         ["HotkeyHint"] = "انقر على الحقل واضغط على تركيبة المفاتيح",
         ["SectionGeneral"] = "عام",
         ["StartWithWindows"] = "التشغيل مع بدء Windows",
