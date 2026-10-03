@@ -42,6 +42,7 @@ internal static class Pl
         ["DateAll"] = "Cały okres",
         ["MenuPaste"] = "Wklej",
         ["MenuPastePlain"] = "Wklej jako zwykły tekst",
+        ["MenuTypeText"] = "Wpisz jako naciśnięcia klawiszy (Alt+Enter)",
         ["MenuCopy"] = "Kopiuj",
         ["MenuSaveAs"] = "Zapisz jako...",
         ["MenuOpenInEditor"] = "Otwórz w edytorze",

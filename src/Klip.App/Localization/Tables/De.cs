@@ -42,6 +42,7 @@ internal static class De
         ["DateAll"] = "Gesamter Zeitraum",
         ["MenuPaste"] = "Einfügen",
         ["MenuPastePlain"] = "Als unformatierten Text einfügen",
+        ["MenuTypeText"] = "Als Tastenanschläge eingeben (Alt+Enter)",
         ["MenuCopy"] = "Kopieren",
         ["MenuSaveAs"] = "Speichern unter...",
         ["MenuOpenInEditor"] = "Im Editor öffnen",

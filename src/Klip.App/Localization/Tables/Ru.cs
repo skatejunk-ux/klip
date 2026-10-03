@@ -42,6 +42,7 @@ internal static class Ru
         ["DateAll"] = "За всё время",
         ["MenuPaste"] = "Вставить",
         ["MenuPastePlain"] = "Вставить как простой текст",
+        ["MenuTypeText"] = "Ввести как нажатия клавиш (Alt+Enter)",
         ["MenuCopy"] = "Копировать",
         ["MenuSaveAs"] = "Сохранить как...",
         ["MenuOpenInEditor"] = "Открыть в редакторе",

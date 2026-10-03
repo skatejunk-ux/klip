@@ -42,6 +42,7 @@ internal static class Ko
         ["DateAll"] = "전체 기간",
         ["MenuPaste"] = "붙여넣기",
         ["MenuPastePlain"] = "일반 텍스트로 붙여넣기",
+        ["MenuTypeText"] = "키 입력으로 입력 (Alt+Enter)",
         ["MenuCopy"] = "복사",
         ["MenuSaveAs"] = "다른 이름으로 저장...",
         ["MenuOpenInEditor"] = "편집기에서 열기",

@@ -42,6 +42,7 @@ internal static class Fr
         ["DateAll"] = "Toute la période",
         ["MenuPaste"] = "Coller",
         ["MenuPastePlain"] = "Coller en texte brut",
+        ["MenuTypeText"] = "Saisir au clavier (Alt+Enter)",
         ["MenuCopy"] = "Copier",
         ["MenuSaveAs"] = "Enregistrer sous...",
         ["MenuOpenInEditor"] = "Ouvrir dans l'éditeur",

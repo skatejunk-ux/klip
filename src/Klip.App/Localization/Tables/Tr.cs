@@ -42,6 +42,7 @@ internal static class Tr
         ["DateAll"] = "Tüm zamanlar",
         ["MenuPaste"] = "Yapıştır",
         ["MenuPastePlain"] = "Düz metin olarak yapıştır",
+        ["MenuTypeText"] = "Tuş vuruşu olarak yaz (Alt+Enter)",
         ["MenuCopy"] = "Kopyala",
         ["MenuSaveAs"] = "Farklı kaydet...",
         ["MenuOpenInEditor"] = "Düzenleyicide aç",

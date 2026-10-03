@@ -42,6 +42,7 @@ internal static class Hi
         ["DateAll"] = "पूरा समय",
         ["MenuPaste"] = "चिपकाएँ",
         ["MenuPastePlain"] = "सादे टेक्स्ट के रूप में चिपकाएँ",
+        ["MenuTypeText"] = "कीस्ट्रोक के रूप में टाइप करें (Alt+Enter)",
         ["MenuCopy"] = "कॉपी करें",
         ["MenuSaveAs"] = "इस रूप में सहेजें...",
         ["MenuOpenInEditor"] = "संपादक में खोलें",

@@ -131,6 +131,7 @@ public static class Loc
     public static string DateAll => Get(nameof(DateAll));
     public static string MenuPaste => Get(nameof(MenuPaste));
     public static string MenuPastePlain => Get(nameof(MenuPastePlain));
+    public static string MenuTypeText => Get(nameof(MenuTypeText));
     public static string MenuCopy => Get(nameof(MenuCopy));
     public static string MenuSaveAs => Get(nameof(MenuSaveAs));
     public static string MenuOpenInEditor => Get(nameof(MenuOpenInEditor));
@@ -490,6 +491,7 @@ public static class Loc
         [nameof(DateAll)] = "Todo o período",
         [nameof(MenuPaste)] = "Colar",
         [nameof(MenuPastePlain)] = "Colar como texto puro",
+        [nameof(MenuTypeText)] = "Digitar como teclas (Alt+Enter)",
         [nameof(MenuCopy)] = "Copiar",
         [nameof(MenuSaveAs)] = "Salvar como...",
         [nameof(MenuOpenInEditor)] = "Abrir no editor",
@@ -834,6 +836,7 @@ public static class Loc
         [nameof(DateAll)] = "All time",
         [nameof(MenuPaste)] = "Paste",
         [nameof(MenuPastePlain)] = "Paste as plain text",
+        [nameof(MenuTypeText)] = "Type as keystrokes (Alt+Enter)",
         [nameof(MenuCopy)] = "Copy",
         [nameof(MenuSaveAs)] = "Save as...",
         [nameof(MenuOpenInEditor)] = "Open in editor",

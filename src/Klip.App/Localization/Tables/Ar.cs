@@ -42,6 +42,7 @@ internal static class Ar
         ["DateAll"] = "كل الفترات",
         ["MenuPaste"] = "لصق",
         ["MenuPastePlain"] = "لصق كنص عادي",
+        ["MenuTypeText"] = "اكتب كضغطات مفاتيح (Alt+Enter)",
         ["MenuCopy"] = "نسخ",
         ["MenuSaveAs"] = "حفظ باسم...",
         ["MenuOpenInEditor"] = "فتح في المحرر",

@@ -42,6 +42,7 @@ internal static class Zh
         ["DateAll"] = "全部时间",
         ["MenuPaste"] = "粘贴",
         ["MenuPastePlain"] = "以纯文本粘贴",
+        ["MenuTypeText"] = "以按键方式输入 (Alt+Enter)",
         ["MenuCopy"] = "复制",
         ["MenuSaveAs"] = "另存为...",
         ["MenuOpenInEditor"] = "在编辑器中打开",

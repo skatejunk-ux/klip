@@ -42,6 +42,7 @@ internal static class It
         ["DateAll"] = "Tutto il periodo",
         ["MenuPaste"] = "Incolla",
         ["MenuPastePlain"] = "Incolla come testo semplice",
+        ["MenuTypeText"] = "Digita come tasti (Alt+Enter)",
         ["MenuCopy"] = "Copia",
         ["MenuSaveAs"] = "Salva con nome...",
         ["MenuOpenInEditor"] = "Apri nell'editor",

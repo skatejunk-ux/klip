@@ -42,6 +42,7 @@ internal static class Es
         ["DateAll"] = "Todo el período",
         ["MenuPaste"] = "Pegar",
         ["MenuPastePlain"] = "Pegar como texto sin formato",
+        ["MenuTypeText"] = "Escribir como pulsaciones (Alt+Enter)",
         ["MenuCopy"] = "Copiar",
         ["MenuSaveAs"] = "Guardar como...",
         ["MenuOpenInEditor"] = "Abrir en el editor",

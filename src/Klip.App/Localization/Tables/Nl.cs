@@ -42,6 +42,7 @@ internal static class Nl
         ["DateAll"] = "Alles",
         ["MenuPaste"] = "Plakken",
         ["MenuPastePlain"] = "Plakken als platte tekst",
+        ["MenuTypeText"] = "Typen als toetsaanslagen (Alt+Enter)",
         ["MenuCopy"] = "Kopiëren",
         ["MenuSaveAs"] = "Opslaan als...",
         ["MenuOpenInEditor"] = "Openen in editor",
