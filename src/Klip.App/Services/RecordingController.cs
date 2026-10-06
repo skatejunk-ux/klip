@@ -126,6 +126,7 @@ public sealed class RecordingController(
     {
         if (IsActive)
         {
+            StartupLog.Write($"Gravacao ignorada: sessao anterior ainda em {_state}");
             // toolbar e NOACTIVATE (Activate seria no-op): realce visual rapido
             _toolbar?.FlashAttention();
             return;

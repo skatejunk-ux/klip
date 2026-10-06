@@ -255,6 +255,14 @@ public sealed class CaptureOverlayWindow : Window
         NativeMethods.SetWindowPos(helper.Handle, nint.Zero, b.left, b.top,
             b.right - b.left, b.bottom - b.top, NativeMethods.SWP_NOZORDER);
 
+        // all Klip windows share the UI thread: a capture left behind by another
+        // window (editor, media editor timeline) would swallow every click here
+        if (Mouse.Captured is { } stale)
+        {
+            StartupLog.Write($"Overlay: released stale mouse capture held by {stale.GetType().Name}");
+            Mouse.Capture(null);
+        }
+
         Show();
         Activate();
         Focus();
