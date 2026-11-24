@@ -129,9 +129,15 @@ public partial class EditorWindow
             UpdateLayout();
             LoadPreferences();
             ApplyDrawingAttributes();
-            // Only fit to window if zoom wasn't explicitly set (still at default 1.0)
-            if (Math.Abs(ZoomSlider.Value - 1.0) < 0.01)
-                FitToWindow();
+            // the image sits StageMargin deep in the whiteboard, so it must always be scrolled
+            // into view; wait for the maximize to settle so the viewport size is final
+            Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+            {
+                if (Math.Abs(ZoomSlider.Value - 1.0) < 0.01)
+                    FitToWindow();
+                else
+                    CenterOnImage();
+            });
         };
 
         // Save window state when maximized/restored
@@ -363,9 +369,9 @@ public partial class EditorWindow
 
         // Preference saving buttons
         SavePreferencesButton.Click += (_, _) => SavePreferences();
-        Zoom75Button.Click += (_, _) => { ZoomSlider.Value = 0.75; SavePreferences(); };
-        Zoom100Button.Click += (_, _) => { ZoomSlider.Value = 1.0; SavePreferences(); };
-        Zoom125Button.Click += (_, _) => { ZoomSlider.Value = 1.25; SavePreferences(); };
+        Zoom75Button.Click += (_, _) => { ZoomSlider.Value = 0.75; CenterOnImage(); SavePreferences(); };
+        Zoom100Button.Click += (_, _) => { ZoomSlider.Value = 1.0; CenterOnImage(); SavePreferences(); };
+        Zoom125Button.Click += (_, _) => { ZoomSlider.Value = 1.25; CenterOnImage(); SavePreferences(); };
 
         // Always Fullscreen checkbox
         AlwaysMaximizedCheckBox.Checked += (_, _) => SavePreferences();
