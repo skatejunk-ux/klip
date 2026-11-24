@@ -13,22 +13,13 @@ using Microsoft.Win32;
 namespace Klip.App.Views.Pages;
 
 /// <summary>
-/// RF-S.05 - secao "Manutencao e backup" (absorve <c>SectionMaintenance</c> e
-/// <c>SectionDiagnostics</c>): exportar/importar historico, compactar o banco, abrir
-/// a pasta de dados e rodar o diagnostico.
+/// Maintenance: export/import the history, compact the database, open the data
+/// folder, the diagnostics dump and the resource panel.
 /// <para>
-/// RF-S.08: exportar, importar, compactar e o diagnostico rodam em
-/// <c>Task.Run</c>. Na MainWindow os quatro eram IO/SQLite SINCRONO na UI thread e
-/// podiam levar segundos: o export le o banco inteiro e escreve um ZIP, o import
-/// descompacta e faz <c>ExistsByHash</c> + <c>Upsert</c> por item (N+1), o compact
-/// roda <c>VACUUM</c> e o diagnostico soma <c>SELECT COUNT(*)</c> + 4 leituras de
-/// registro. Cada operacao desabilita os botoes, mostra uma barra indeterminada e
-/// publica o resultado de volta pelo Dispatcher.
-/// </para>
-/// <para>
-/// RF-S.07: os rotulos do diagnostico sairam do codigo (estavam fixos em pt-BR) e
-/// agora vem de <c>Loc.Diag*</c>; o nome default do arquivo de backup vem de
-/// <c>Loc.BackupFileName</c>.
+/// Export, import, compact and diagnostics run on <c>Task.Run</c>: export reads the
+/// whole database and writes a ZIP, import does ExistsByHash + Upsert per item, compact
+/// runs VACUUM. Each one disables the buttons, shows an indeterminate bar and posts the
+/// result back through the dispatcher.
 /// </para>
 /// </summary>
 public partial class MaintenancePage : ISettingsPage
@@ -43,10 +34,8 @@ public partial class MaintenancePage : ISettingsPage
     private string _lastReport = "";
 
     /// <summary>
-    /// ADR-S.07: guards de reentrancia. Os dois sao ligados e desligados dentro de
-    /// <c>try/finally</c> - sem isso uma falha no meio de um import deixaria os
-    /// botoes desabilitados e a barra girando ate reiniciar o app (que e exatamente
-    /// o defeito do <c>_loading</c> da MainWindow).
+    /// Reentrancy guards, always flipped inside try/finally: a failure halfway through
+    /// an import can't leave the buttons disabled and the bar spinning until restart.
     /// </summary>
     private bool _maintenanceBusy;
 
@@ -69,22 +58,31 @@ public partial class MaintenancePage : ISettingsPage
         PageDiagnostics.TrackConstruction(this);
         InitializeComponent();
 
-        // RF-S.05: assinatura no CONSTRUTOR, nunca em Loaded - a pagina e singleton
-        // (ADR-S.03) e Loaded dispara a cada re-entrada na arvore visual.
+        // handlers in the constructor, never in Loaded: singleton page, and Loaded
+        // fires on every return to the visual tree.
         // Os lambdas async sao async void por serem RoutedEventHandler: cada metodo
         // abaixo trata TODAS as suas excecoes, entao nada escapa para o dispatcher.
         ExportButton.Click += async (_, _) => await OnExportAsync();
         ImportButton.Click += async (_, _) => await OnImportAsync();
         CompactButton.Click += async (_, _) => await OnCompactAsync();
         OpenDataFolderButton.Click += (_, _) => OnOpenDataFolder();
-        DiagnosticsButton.Click += async (_, _) => await OnRunDiagnosticsAsync();
+        DiagnosticsButton.Click += async (_, _) =>
+        {
+            DiagnosticsExpander.IsExpanded = true; // o resultado aparece dentro do cartao
+            await OnRunDiagnosticsAsync();
+        };
         CopyDiagnosticsButton.Click += async (_, _) => await OnCopyDiagnosticsAsync();
+        ResourcesButton.Click += async (_, _) =>
+        {
+            ResourcesExpander.IsExpanded = true;
+            await OnRefreshResourcesAsync();
+        };
 
         RefreshState();
     }
 
     /// <summary>
-    /// RF-S.05: chamado no fim do construtor e a cada entrada na pagina
+    /// Called at the end of the constructor and on every visit to the page
     /// (<c>SettingsShell.OnNavigated</c>).
     /// <para>
     /// A pagina nao expoe nenhum ajuste persistido - os dois blocos sao acoes -,
@@ -104,9 +102,52 @@ public partial class MaintenancePage : ISettingsPage
     {
         ApplyMaintenanceBusy(_maintenanceBusy);
         ApplyDiagnosticsBusy(_diagnosticsBusy);
+        LoadUsage();
     }
 
-    // ----- Backup e manutencao (RF-S.08) -----
+    // ----- Uso de disco -----
+
+    private bool _usageLoading;
+
+    /// <summary>Item count and database size, read off the ui thread (was on the About page).</summary>
+    private void LoadUsage()
+    {
+        if (_usageLoading)
+            return;
+        _usageLoading = true;
+        UsageCard.Description = "...";
+        _ = Task.Run(() =>
+        {
+            long? count = null, bytes = null;
+            try
+            {
+                count = _repository.Count();
+                var db = AppPaths.DatabaseFile;
+                bytes = File.Exists(db) ? new FileInfo(db).Length : 0L;
+                if (Directory.Exists(AppPaths.MediaDir))
+                {
+                    foreach (var file in new DirectoryInfo(AppPaths.MediaDir).EnumerateFiles("*", SearchOption.AllDirectories))
+                        bytes += file.Length;
+                }
+            }
+            catch (Exception ex)
+            {
+                // banco em uso exclusivo, arquivo sumindo no meio: estatistica nao derruba a pagina
+                StartupLog.WriteException("MaintenancePage.LoadUsage", ex);
+            }
+            _ = Dispatcher.InvokeAsync(() =>
+            {
+                _usageLoading = false;
+                UsageCard.Description = count is null || bytes is null
+                    ? string.Empty
+                    : string.Format(System.Globalization.CultureInfo.CurrentCulture, Loc.UsageValue,
+                        count.Value.ToString("N0", System.Globalization.CultureInfo.CurrentCulture),
+                        (bytes.Value / 1024.0 / 1024.0).ToString("F1", System.Globalization.CultureInfo.CurrentCulture));
+            });
+        });
+    }
+
+    // ----- Backup e manutencao -----
 
     private async Task OnExportAsync()
     {
@@ -119,7 +160,6 @@ public partial class MaintenancePage : ISettingsPage
             var dialog = new SaveFileDialog
             {
                 Filter = Loc.BackupFilter,
-                // RF-S.07: o nome default era "Klip {yyyy-MM-dd}.zip" fixo no codigo
                 FileName = string.Format(Loc.BackupFileName, DateTime.Now),
             };
             if (dialog.ShowDialog() != true)
@@ -162,7 +202,7 @@ public partial class MaintenancePage : ISettingsPage
 
         // Import e o pior dos tres: descompacta e faz ExistsByHash + Upsert POR ITEM
         // (N+1 consultas). A contagem de itens do historico nao e reexibida aqui -
-        // ela foi para a AboutPage (RF-S.06); quem quiser o numero novo roda o
+        // ela foi para a AboutPage; quem quiser o numero novo roda o
         // diagnostico logo abaixo.
         await RunMaintenanceAsync("Import", () =>
         {
@@ -204,9 +244,7 @@ public partial class MaintenancePage : ISettingsPage
         }
     }
 
-    /// <summary>
-    /// RF-S.08: tira o trabalho da UI thread e publica o resultado de volta nela.
-    /// </summary>
+    /// <summary>Runs the work off the UI thread and posts the result back to it.</summary>
     private async Task RunMaintenanceAsync(string context, Func<string> work)
     {
         ApplyMaintenanceBusy(true);
@@ -247,7 +285,7 @@ public partial class MaintenancePage : ISettingsPage
         MaintenanceProgress.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    // ----- Diagnostico (RF-S.07 / RF-S.08) -----
+    // ----- Diagnostico -----
 
     private async Task OnRunDiagnosticsAsync()
     {
@@ -286,14 +324,14 @@ public partial class MaintenancePage : ISettingsPage
         ApplyDiagnosticsBusy(true);
         try
         {
-            // ADR-P.05: NUNCA System.Windows.Clipboard direto. Abrir o clipboard e um
+            // NUNCA System.Windows.Clipboard direto. Abrir o clipboard e um
             // lock global do sistema e o caminho do WPF dorme ate ~1 s por retry
             // interno, entao todo acesso vive na thread STA dedicada
             // (Services/ClipboardThread). O Invoke do ClipboardWriteGuard e SINCRONO
             // na thread de quem chama - por isso a chamada sai da UI thread no
             // Task.Run, e nao apenas "porque escrever no clipboard e lento".
             // Efeito colateral desejado: o guard registra o sequence number
-            // (RF-03.09), logo o dump nao volta como item do proprio historico.
+            // (anti-loop), logo o dump nao volta como item do proprio historico.
             await Task.Run(() => _clipboard.WriteText(report));
             DiagnosticsStatus.Text = Loc.DiagCopied;
         }
@@ -309,7 +347,7 @@ public partial class MaintenancePage : ISettingsPage
     }
 
     /// <summary>
-    /// RF-S.07 / RF-S.08: monta o relatorio FORA da UI thread. Nada aqui toca a
+    /// Monta o relatorio FORA da UI thread. Nada aqui toca a
     /// arvore visual, e <c>Loc.*</c> e leitura de dicionario em memoria (sem
     /// afinidade de thread). As leituras caras estao todas aqui: <c>Count()</c> e um
     /// <c>SELECT COUNT(*)</c>, <c>GetState()</c> sao 4 aberturas de chave de
@@ -333,11 +371,9 @@ public partial class MaintenancePage : ISettingsPage
         text.AppendLine($"{Loc.DiagHklmOff}: {state.HklmClipboardFeatureOff}");
         text.Append($"{Loc.DiagPolicies}: {state.HasManagedPolicies}");
 
-        // RF-P0.01: a linha mais importante do diagnostico, por isso sai separada e
-        // vai destacada na tela. "teclado=nao, mouse=nao" em repouso e o criterio
-        // CA-P1.3: um hook de baixo nivel instalado e chamado pela Raw Input Thread
-        // do Windows a cada evento de teclado e mouse do sistema inteiro, e e isso
-        // que degrada o frame time de jogos.
+        // a linha mais importante do diagnostico, por isso sai separada e destacada.
+        // "teclado=nao, mouse=nao" em repouso: um hook LL instalado e chamado pela Raw
+        // Input Thread a cada evento do sistema inteiro, e e isso que pesa em jogos
         return new DiagnosticsReport(HookHealth.FormatSummary(), text.ToString());
     }
 
@@ -348,6 +384,33 @@ public partial class MaintenancePage : ISettingsPage
         CopyDiagnosticsButton.IsEnabled = !busy && _lastReport.Length > 0;
         DiagnosticsProgress.IsIndeterminate = busy;
         DiagnosticsProgress.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    // ----- Recursos -----
+
+    private bool _resourcesBusy;
+
+    private async Task OnRefreshResourcesAsync()
+    {
+        if (_resourcesBusy)
+            return;
+        _resourcesBusy = true;
+        ResourcesButton.IsEnabled = false;
+        try
+        {
+            ResourcesText.Text = await Task.Run(ResourceSnapshot.Build);
+        }
+        catch (Exception ex)
+        {
+            ResourcesText.Text = ex.Message;
+            StartupLog.WriteException("Recursos", ex);
+        }
+        finally
+        {
+            ResourcesText.Visibility = Visibility.Visible;
+            ResourcesButton.IsEnabled = true;
+            _resourcesBusy = false;
+        }
     }
 
     /// <summary>Relatorio montado fora da UI thread; a linha dos hooks vai separada.</summary>

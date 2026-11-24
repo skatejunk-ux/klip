@@ -12,7 +12,7 @@ public enum SystemActivityState
 }
 
 /// <summary>
-/// Deteccao de tela cheia para auto-suspensao (RF-P1.06): combina o estado de
+/// Deteccao de tela cheia para auto-suspensao: combina o estado de
 /// notificacao do shell com uma heuristica geometrica que pega o borderless.
 /// <para>
 /// O Windows NAO envia notificacao ao entrar/sair de tela cheia, entao o consumidor
@@ -109,14 +109,14 @@ public static class SystemFullscreenDetector
     public static SystemActivityState Evaluate()
     {
         var state = QueryNotificationState();
-        if (state is QUERY_USER_NOTIFICATION_STATE.QUNS_NOT_PRESENT
-            or QUERY_USER_NOTIFICATION_STATE.QUNS_PRESENTATION_MODE)
+        if (state is QUERY_USER_NOTIFICATION_STATE.QUNS_PRESENTATION_MODE
+            or QUERY_USER_NOTIFICATION_STATE.QUNS_NOT_PRESENT)
         {
             return SystemActivityState.Suspended;
         }
 
         // the shell reports BUSY for our own topmost capture overlay too; when a
-        // Klip window is in front the user is interacting with us, not a game
+        // Klip window is in front the user is working with us, not playing a game
         if (state is QUERY_USER_NOTIFICATION_STATE.QUNS_BUSY
             or QUERY_USER_NOTIFICATION_STATE.QUNS_RUNNING_D3D_FULL_SCREEN)
         {
@@ -140,6 +140,10 @@ public static class SystemFullscreenDetector
                 && processId == (uint)Environment.ProcessId;
         }
         catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        catch (DllNotFoundException)
         {
             return false;
         }

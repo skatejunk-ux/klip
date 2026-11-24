@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 namespace Klip.Interop;
 
 /// <summary>
-/// P/Invoke de QoS/energia (RF-P3.03): EcoQoS por processo e por thread,
+/// P/Invoke de QoS/energia: EcoQoS por processo e por thread,
 /// prioridade de memoria e background IO mode.
 /// </summary>
 public static partial class NativeMethods
@@ -94,6 +94,28 @@ public static partial class NativeMethods
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool SetThreadPriority(nint hThread, int nPriority);
+
+    /// <summary>
+    /// Interrupt time in 100 ns units that does not advance while the machine sleeps or
+    /// hibernates. Compared with a clock that does, it tells whether an interval crossed
+    /// a suspend.
+    /// </summary>
+    [LibraryImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool QueryUnbiasedInterruptTime(out ulong unbiasedTime);
+
+    // ----- priority class -----
+
+    public const uint IDLE_PRIORITY_CLASS = 0x40;
+    public const uint BELOW_NORMAL_PRIORITY_CLASS = 0x4000;
+    public const uint NORMAL_PRIORITY_CLASS = 0x20;
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    public static partial uint GetPriorityClass(nint hProcess);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool SetPriorityClass(nint hProcess, uint dwPriorityClass);
 
     /// <summary>Pseudo-handle do processo atual (-1); nao precisa ser fechado.</summary>
     [LibraryImport("kernel32.dll")]

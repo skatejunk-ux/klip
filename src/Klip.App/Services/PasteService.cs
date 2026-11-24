@@ -12,16 +12,16 @@ namespace Klip.App.Services;
 /// restaurar o foco (com fallback em AttachThreadInput), disparar Ctrl+V por
 /// SendInput e, no fim, devolver o clipboard anterior se a opcao estiver ligada.
 ///
-/// RF-P2.01 / ADR-P.05: nenhuma etapa de clipboard roda na UI thread. Antes o
-/// snapshot saia sincrono na UI thread e a gravacao voltava para ela por
-/// dispatcher.Invoke; agora tudo vai para a <see cref="ClipboardThread"/>. A UI
-/// thread so e usada para o evento PasteFailed (que mexe no tray).
+/// Nenhuma etapa de clipboard roda na UI thread: tudo vai para a
+/// <see cref="ClipboardThread"/>. A UI thread so e usada para o evento
+/// PasteFailed (que mexe no tray).
 /// </summary>
 public sealed class PasteService(
     ClipboardWriteGuard writeGuard,
     MediaStore mediaStore,
     SettingsService settings,
-    ClipboardThread clipboardThread)
+    ClipboardThread clipboardThread,
+    ClipboardItemRepository repository)
 {
     /// <summary>
     /// Dispatcher da UI, resolvido uma vez na construcao (o host sobe na UI
@@ -34,6 +34,11 @@ public sealed class PasteService(
 
     /// <summary>Dispara quando a colagem falha, para mostrarmos um toast de fallback.</summary>
     public event Action? PasteFailed;
+
+    /// <summary>Typing as keystrokes ended early: Esc, or the target app lost the front.</summary>
+    public event Action? TypingStopped;
+
+    private const int VK_ESCAPE = 0x1B;
 
     /// <summary>
     /// Salva o app que esta com o foco, para colarmos de volta nele. Se o
@@ -68,6 +73,8 @@ public sealed class PasteService(
     {
         var target = SavedTargetWindow;
         var restore = settings.Current.RestoreClipboardAfterPaste;
+        var forcePlain = settings.Current.AlwaysPastePlainText;
+        var richApps = forcePlain ? settings.Current.RichPasteApps.ToArray() : [];
 
         // decodifica a imagem (disco + decode) FORA da UI thread; texto e barato
         var isImage = item.Type == ClipboardItemType.Image && item.FilePath is not null;
@@ -79,9 +86,13 @@ public sealed class PasteService(
             System.Windows.IDataObject? previous = null;
             try
             {
-                // RF-P2.01: o snapshot saiu da UI thread. Ele so precisa
-                // acontecer ANTES da gravacao, e continua acontecendo - as duas
-                // operacoes sao sequenciais aqui e caem na mesma fila STA.
+                // the list hands us a slim row; the full content (html, rtf, long text)
+                // is read here, off the UI thread
+                var full = repository.LoadFull(item);
+                var plain = asPlainText || (forcePlain && !IsRichPasteTarget(target, richApps));
+
+                // o snapshot so precisa acontecer ANTES da gravacao, e continua
+                // acontecendo: as duas operacoes sao sequenciais e caem na mesma fila STA
                 if (restore)
                     previous = writeGuard.SnapshotCurrent();
 
@@ -96,7 +107,7 @@ public sealed class PasteService(
                     if (bitmap is not null && pngBytes is not null)
                         writeGuard.WriteImageFromPng(pngBytes, bitmap);
                     else
-                        writeGuard.WriteItem(item, plainTextOnly: asPlainText);
+                        writeGuard.WriteItem(full, plainTextOnly: plain);
                 });
 
                 if (!BringTargetBack(target))
@@ -126,16 +137,58 @@ public sealed class PasteService(
     }
 
     /// <summary>
-    /// Tempo para o app alvo devolver o foco ao proprio campo depois de reativado.
-    /// Browsers (Chromium) e o TeamViewer fazem isso de forma assincrona; um Ctrl+V
-    /// que chega antes cai na janela sem campo focado e some.
+    /// With "always paste as plain text" on, these apps still get the formatting.
+    /// Matched by exe name (WINWORD.EXE), with or without the .exe.
+    /// </summary>
+    private static bool IsRichPasteTarget(nint target, string[] richApps)
+    {
+        if (target == nint.Zero || richApps.Length == 0)
+            return false;
+        var exe = ProcessExeName(target);
+        if (exe is null)
+            return false;
+        var bare = System.IO.Path.GetFileNameWithoutExtension(exe);
+        foreach (var app in richApps)
+        {
+            var name = app.Trim();
+            if (string.Equals(name, exe, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, bare, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static string? ProcessExeName(nint hwnd)
+    {
+        NativeMethods.GetWindowThreadProcessId(hwnd, out var pid);
+        if (pid == 0)
+            return null;
+        var handle = NativeMethods.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (handle == nint.Zero)
+            return null;
+        try
+        {
+            var path = NativeMethods.QueryProcessImagePathSafe(handle);
+            return string.IsNullOrEmpty(path) ? null : System.IO.Path.GetFileName(path);
+        }
+        finally
+        {
+            NativeMethods.CloseHandle(handle);
+        }
+    }
+
+    /// <summary>
+    /// Time for the target app to hand focus back to its own field after being
+    /// reactivated. Browsers and TeamViewer do that asynchronously; a Ctrl+V that
+    /// arrives earlier lands on a window with no focused field and just vanishes.
     /// </summary>
     private const int FocusSettleMs = 120;
 
     /// <summary>
-    /// Devolve o foreground ao alvo. So espera o foco assentar quando o alvo de fato
-    /// perdeu a ativacao (clique no campo de busca, menu); no caminho normal o flyout
-    /// abre sem ativar e o alvo nunca deixou de ser o foreground.
+    /// Brings the target back to the front. Only waits for focus to settle when the
+    /// target really lost activation (a click on the search box, a menu); in the normal
+    /// path the panel opens without activating and the target never stopped being the
+    /// foreground window.
     /// </summary>
     private static bool BringTargetBack(nint target)
     {
@@ -151,6 +204,59 @@ public sealed class PasteService(
         if (!wasForeground)
             Thread.Sleep(FocusSettleMs);
         return ok;
+    }
+
+    /// <summary>
+    /// Types the item's text as keystrokes instead of pasting it. For fields that refuse
+    /// Ctrl+V (password boxes, TeamViewer ID and password, remote sessions). Leaves the
+    /// clipboard alone.
+    /// </summary>
+    public void TypeItem(ClipboardItem item)
+    {
+        if (item.Type is not (ClipboardItemType.Text or ClipboardItemType.Html))
+            return;
+        var target = SavedTargetWindow;
+
+        _ = Task.Run(() =>
+        {
+            var finished = false;
+            try
+            {
+                // the list hands us a slim row, so the full text is read here, off the UI thread
+                var text = repository.LoadFull(item).TextContent;
+                if (string.IsNullOrEmpty(text))
+                    return;
+
+                // never type into a window that is not the one the user picked
+                if (BringTargetBack(target))
+                {
+                    NativeMethods.ReleasePressedModifiers();
+                    Thread.Sleep(20);
+
+                    // Esc is the panic button. It only counts as a fresh press, so an Esc that
+                    // was already down does not stop us at once. Typing into the wrong window
+                    // is worse than stopping, so the target losing the front stops it too
+                    var escWasDown = NativeMethods.IsKeyDown(VK_ESCAPE);
+                    bool Cancel()
+                    {
+                        var esc = NativeMethods.IsKeyDown(VK_ESCAPE);
+                        var freshPress = esc && !escWasDown;
+                        escWasDown = esc;
+                        return freshPress
+                            || (target != nint.Zero && NativeMethods.GetForegroundWindow() != target);
+                    }
+
+                    finished = NativeMethods.SendUnicodeText(text, Cancel);
+                }
+            }
+            catch (Exception ex)
+            {
+                StartupLog.WriteException("TypeItem", ex);
+            }
+
+            if (!finished)
+                _uiDispatcher.BeginInvoke(() => TypingStopped?.Invoke());
+        });
     }
 
     /// <summary>
@@ -172,40 +278,6 @@ public sealed class PasteService(
         }
     }
 
-    /// <summary>
-    /// Types the item's text as keystrokes instead of pasting. For fields that
-    /// refuse Ctrl+V (password boxes, TeamViewer ID/password, remote sessions).
-    /// Doesn't touch the clipboard at all.
-    /// </summary>
-    public void TypeItem(ClipboardItem item)
-    {
-        var text = item.TextContent;
-        if (string.IsNullOrEmpty(text) || item.Type == ClipboardItemType.Image)
-            return;
-        var target = SavedTargetWindow;
-
-        _ = Task.Run(() =>
-        {
-            var ok = true;
-            try
-            {
-                if (!BringTargetBack(target))
-                    ok = false;
-                NativeMethods.ReleasePressedModifiers();
-                Thread.Sleep(20);
-                NativeMethods.SendUnicodeText(text);
-            }
-            catch (Exception ex)
-            {
-                StartupLog.WriteException("TypeItem", ex);
-                ok = false;
-            }
-
-            if (!ok)
-                _uiDispatcher.BeginInvoke(() => PasteFailed?.Invoke());
-        });
-    }
-
     /// <summary>So copiar, sem colar (Ctrl+clique). Nada disso toca a UI thread.</summary>
     public void CopyItemToClipboard(ClipboardItem item, bool asPlainText = false)
     {
@@ -224,7 +296,7 @@ public sealed class PasteService(
                 }
                 else
                 {
-                    writeGuard.WriteItem(item, plainTextOnly: asPlainText);
+                    writeGuard.WriteItem(repository.LoadFull(item), plainTextOnly: asPlainText);
                 }
             }
             catch (Exception ex)
@@ -235,7 +307,154 @@ public sealed class PasteService(
     }
 
     /// <summary>Grava texto puro e cola no alvo (usado pelo painel de emoji).</summary>
-    public void PasteText(string text)
+    public void PasteText(string text) => PasteTextCore(() => text);
+
+    /// <summary>Resolves the snippet placeholders right before pasting it.</summary>
+    public void PasteSnippet(string content) => PasteTextCore(() => ExpandSnippet(content));
+
+    /// <summary>Copies the expanded snippet without pasting.</summary>
+    public void CopySnippet(string content) => CopyText(() => ExpandSnippet(content));
+
+    /// <summary>Plain text to the clipboard, off the UI thread (OCR result, joined items).</summary>
+    public void CopyText(string text) => CopyText(() => text);
+
+    private void CopyText(Func<string> text) =>
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                writeGuard.WriteText(text());
+            }
+            catch (Exception ex)
+            {
+                StartupLog.WriteException("CopyText", ex);
+            }
+        });
+
+    /// <summary>
+    /// Several items at once (collect mode, "paste together"). All text: one paste with a
+    /// line break between them. With images or files: pasted one after the other in a
+    /// single go, runs of text still joined into one block.
+    /// </summary>
+    public void PasteTogether(IReadOnlyList<ClipboardItem> items, System.Windows.IDataObject? restoreAfter = null)
+    {
+        if (items.Count == 0)
+            return;
+        if (Klip.Core.Clipboard.PasteJoin.CanJoinAsText(items))
+        {
+            PasteTextCore(() => JoinText(items));
+            return;
+        }
+        PasteSeries(items, restoreAfter);
+    }
+
+    /// <summary>The items' text joined one per line, read in full from the database.</summary>
+    public string JoinText(IEnumerable<ClipboardItem> items) =>
+        Klip.Core.Clipboard.PasteJoin.Join(items.Select(i => repository.LoadFull(i).TextContent));
+
+    /// <summary>
+    /// Builds the steps of a mixed pick: each run of text becomes one synthetic text item
+    /// (id 0), images and files stay as they are. Full rows, read here.
+    /// </summary>
+    public List<ClipboardItem> PlanSteps(IReadOnlyList<ClipboardItem> items)
+    {
+        var steps = new List<ClipboardItem>();
+        var plan = Klip.Core.Clipboard.PasteJoin.PlanSeries(items, Klip.Core.Clipboard.PasteJoin.IsTextual);
+        for (var i = 0; i < plan.Count; i++)
+        {
+            var step = plan[i];
+            if (step.Count == 1 && !Klip.Core.Clipboard.PasteJoin.IsTextual(step[0]))
+            {
+                steps.Add(repository.LoadFull(step[0]));
+                continue;
+            }
+            // one per line, also next to an image: the text block carries the breaks
+            var text = JoinText(step);
+            if (i > 0)
+                text = "\r\n" + text;
+            if (i < plan.Count - 1)
+                text += "\r\n";
+            steps.Add(new ClipboardItem { Type = ClipboardItemType.Text, TextContent = text, ContentHash = "" });
+        }
+        return steps;
+    }
+
+    // one paste per step, back to back. the wait lets the app read the clipboard before
+    // the next step replaces it
+    private void PasteSeries(IReadOnlyList<ClipboardItem> items, System.Windows.IDataObject? restoreAfter)
+    {
+        var target = SavedTargetWindow;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var steps = PlanSteps(items);
+                if (!BringTargetBack(target))
+                    _uiDispatcher.BeginInvoke(() => PasteFailed?.Invoke());
+                NativeMethods.ReleasePressedModifiers();
+                Thread.Sleep(20);
+                foreach (var step in steps)
+                {
+                    if (step.Type == ClipboardItemType.Image && step.FilePath is not null)
+                    {
+                        var (png, bitmap) = ClipboardWriteGuard.DecodeImageFile(mediaStore.ToAbsolute(step.FilePath));
+                        if (png is not null && bitmap is not null)
+                            clipboardThread.Invoke(() => writeGuard.WriteImageFromPng(png, bitmap));
+                    }
+                    else
+                    {
+                        writeGuard.WriteItem(step, plainTextOnly: step.Id == 0);
+                    }
+                    Thread.Sleep(30);
+                    NativeMethods.SendCtrlV();
+                    Thread.Sleep(250);
+                }
+            }
+            catch (Exception ex)
+            {
+                StartupLog.WriteException("PasteSeries", ex);
+            }
+            if (restoreAfter is not null)
+                clipboardThread.BeginInvoke(() => writeGuard.Restore(restoreAfter));
+        });
+    }
+
+    /// <summary>
+    /// Fires one Ctrl+V into the target for an armed sequence (Enter in the panel, or
+    /// Ctrl+V while the panel had focus). The queue hook sees it and moves on.
+    /// </summary>
+    public void PasteNextInQueue()
+    {
+        var target = SavedTargetWindow;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                BringTargetBack(target);
+                NativeMethods.ReleasePressedModifiers();
+                Thread.Sleep(20);
+                NativeMethods.SendCtrlV();
+            }
+            catch (Exception ex)
+            {
+                StartupLog.WriteException("PasteNextInQueue", ex);
+            }
+        });
+    }
+
+    // {clipboard} reads the clipboard thread; called from a pool thread
+    private string ExpandSnippet(string content)
+    {
+        Func<string?>? clip = null;
+        if (Klip.Core.Snippets.SnippetExpander.UsesClipboard(content))
+        {
+            clip = () => clipboardThread.Invoke(() =>
+                System.Windows.Clipboard.ContainsText() ? System.Windows.Clipboard.GetText() : null);
+        }
+        return Klip.Core.Snippets.SnippetExpander.Expand(content, DateTime.Now, clip);
+    }
+
+    private void PasteTextCore(Func<string> buildText)
     {
         var restore = settings.Current.RestoreClipboardAfterPaste;
         var target = SavedTargetWindow;
@@ -245,9 +464,10 @@ public sealed class PasteService(
             System.Windows.IDataObject? previous = null;
             try
             {
-                // RF-P2.01: snapshot e gravacao sairam da UI thread; a ordem
-                // (snapshot antes da gravacao) continua garantida por serem
-                // sequenciais aqui
+                // built here, off the UI thread: may read the db or the clipboard
+                var text = buildText();
+
+                // snapshot antes da gravacao, garantido por serem sequenciais aqui
                 if (restore)
                     previous = writeGuard.SnapshotCurrent();
 

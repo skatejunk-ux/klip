@@ -2,16 +2,21 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Windows.Threading;
 using Klip.App.Services;
+using Klip.Interop;
 
 namespace Klip.App.Diagnostics;
 
 /// <summary>
-/// RF-P0.02: mede quanto tempo a UI thread demora para atender uma mensagem.
+/// Mede quanto tempo a UI thread demora para atender uma mensagem.
 /// Um bloqueio longo na UI thread do Klip e o que congela o input do sistema
 /// quando ha hook LL instalado - transformar isso em evidencia rastreavel.
 /// <para>
-/// Criterio de aceite CA-P2.1: nenhum bloqueio acima de 50 ms durante 30 min de
+/// Meta: nenhum bloqueio acima de 50 ms durante 30 min de
 /// uso intenso.
+/// </para>
+/// <para>
+/// Roda so com hook LL vivo (ou com --verbose): e quando um travamento da UI vira
+/// travamento de input do sistema. Em repouso fica parado.
 /// </para>
 /// </summary>
 public sealed class UiThreadWatchdog : IDisposable
@@ -59,7 +64,7 @@ public sealed class UiThreadWatchdog : IDisposable
     /// <summary>
     /// Sobe o watchdog. Idempotente.
     /// <para>
-    /// RF-P0.02: <see cref="System.Threading.Timer"/>, nunca DispatcherTimer - a
+    /// <see cref="System.Threading.Timer"/>, nunca DispatcherTimer - a
     /// sonda precisa nascer FORA da UI thread, senao ela mediria a si mesma e
     /// jamais detectaria um bloqueio.
     /// </para>
@@ -129,11 +134,12 @@ public sealed class UiThreadWatchdog : IDisposable
 
             owned = true;
             long start = Stopwatch.GetTimestamp();
+            NativeMethods.QueryUnbiasedInterruptTime(out var startUnbiased);
 
             // DispatcherPriority.Send e a maior prioridade da fila: o que se mede e
             // o tempo ate a UI thread conseguir ATENDER a fila, nao a espera atras
             // de trabalho de menor prioridade legitimamente enfileirado.
-            _uiDispatcher.BeginInvoke(DispatcherPriority.Send, new Action(() => CompleteProbe(start)));
+            _uiDispatcher.BeginInvoke(DispatcherPriority.Send, new Action(() => CompleteProbe(start, startUnbiased)));
 
             // A partir daqui quem devolve o guard e CompleteProbe.
             owned = false;
@@ -153,14 +159,28 @@ public sealed class UiThreadWatchdog : IDisposable
     }
 
     /// <summary>Executa NA UI thread: o tempo ate chegar aqui e a latencia medida.</summary>
-    private void CompleteProbe(long startTimestamp)
+    private void CompleteProbe(long startTimestamp, ulong startUnbiased)
     {
         try
         {
             long elapsedTicks = Stopwatch.GetTimestamp() - startTimestamp;
-            RecordWorst(elapsedTicks);
-
             double elapsedMilliseconds = elapsedTicks * 1000.0 / Stopwatch.Frequency;
+
+            // the stopwatch keeps counting through a sleep, the unbiased clock does not:
+            // a probe queued right before suspend used to come back as a "stall" of hours
+            if (NativeMethods.QueryUnbiasedInterruptTime(out var nowUnbiased))
+            {
+                var awakeMilliseconds = (nowUnbiased - startUnbiased) / 10_000.0;
+                if (elapsedMilliseconds - awakeMilliseconds > _thresholdMilliseconds)
+                {
+                    StartupLog.WriteVerbose(string.Format(CultureInfo.InvariantCulture,
+                        "[watchdog] intervalo atravessou suspensao ({0:0} ms dormindo), descartado",
+                        elapsedMilliseconds - awakeMilliseconds));
+                    return;
+                }
+            }
+
+            RecordWorst(elapsedTicks);
             if (elapsedMilliseconds < _thresholdMilliseconds)
                 return;
 

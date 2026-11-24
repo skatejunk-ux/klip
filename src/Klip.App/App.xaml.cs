@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using Microsoft.Win32;
 using Klip.App.Diagnostics;
 using Klip.App.Localization;
 using Klip.App.Services;
@@ -17,7 +18,6 @@ using Klip.Interop.Input;
 using Klip.Interop.SystemIntegration;
 using H.NotifyIcon;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Wpf.Ui.Abstractions;
 
 namespace Klip.App;
@@ -30,32 +30,49 @@ public partial class App : Application
     private const string MutexName = "Klip.SingleInstance";
 
     private Mutex? _mutex;
-    private IHost? _host;
+    private ServiceProvider? _services;
     private TaskbarIcon? _tray;
     private SettingsShell? _settingsWindow;
     private HistoryFlyoutWindow? _flyout;
+    private Windows.SequenceTicketWindow? _sequenceTicket;
     private PasteService? _pasteService;
     private ClipboardMonitorService? _clipboardMonitor;
     private CaptureController? _captureController;
     private RecordingController? _recordingController;
 
-    // RF-P1.06 / ADR-P.07: rede de seguranca contra interferencia com jogos.
+    // fullscreen game guard. Only polls while a hook scope is alive
     private SystemActivityMonitor? _activityMonitor;
 
-    // RF-P0.02: transforma travamento da UI thread em evidencia rastreavel.
+    // ui thread latency probe. Only runs while a hook scope is alive (or with --verbose)
     private UiThreadWatchdog? _uiWatchdog;
 
-    // RF-P2.09: retencao fora do DispatcherTimer (nao acordar a UI thread num app
-    // que fica horas ocioso) e pulada enquanto houver jogo em tela cheia.
+    // retention on a pool timer, never a DispatcherTimer (no waking the UI thread
+    // of an app that sits idle for hours), skipped while a game is fullscreen
     private System.Threading.Timer? _retentionTimer;
 
-    // pasta do ultimo toast de gravacao: clique no balao abre a pasta (RF-F3.16)
+    // one compacting GC after heavy sessions (overlay, editor, recording)
+    private MemorySettler? _memory;
+
+    // hidden top-level window: message-only windows don't get broadcasts like TaskbarCreated
+    private System.Windows.Interop.HwndSource? _broadcastWindow;
+    private uint _taskbarCreatedMessage;
+
+    // fresh process after hours untouched or a long sleep, see IdleRecycler
+    private IdleRecycler? _idleRecycler;
+    private bool _recycling;
+    private bool _startedByRecycle;
+    private uint _recycledClipboardSequence;
+
+    // tray icon follows the taskbar color (light/dark)
+    private bool? _trayIconLight;
+
+    // folder of the last recording toast: clicking the balloon opens it
     private string? _recordingToastFolder;
 
-    // arquivo do ultimo toast de gravacao MP4: clique abre o editor de midia (RF-F5.16)
+    // file of the last MP4 toast: clicking opens the media editor
     private string? _recordingToastFile;
 
-    // editor de midia (spec F5): uma janela por arquivo, reativada se ja aberta
+    // media editor: one window per file, reactivated if already open
     private readonly Dictionary<string, MediaEditorWindow> _mediaEditors = new(StringComparer.OrdinalIgnoreCase);
 
     public bool IsExiting { get; private set; }
@@ -78,10 +95,34 @@ public partial class App : Application
             return;
         }
 
+        // started by a recycle: the old instance is on its way out and still holds the
+        // mutex for a moment, wait for it instead of quitting as a second instance
+        if (IdleRecycle.TryParseArgs(e.Args, out var oldPid, out var oldSequence))
+        {
+            _startedByRecycle = true;
+            _recycledClipboardSequence = oldSequence;
+            WaitForProcessExit(oldPid, TimeSpan.FromSeconds(15));
+        }
+
         // single instance
         _mutex = new Mutex(initiallyOwned: true, MutexName, out var isFirstInstance);
+        if (!isFirstInstance && _startedByRecycle)
+        {
+            // the old one is still finishing (a slow flush): wait for the mutex a bit
+            // longer instead of leaving the user with no Klip at all
+            try
+            {
+                isFirstInstance = _mutex.WaitOne(TimeSpan.FromSeconds(15));
+            }
+            catch (AbandonedMutexException)
+            {
+                isFirstInstance = true; // the old process died holding it: ours now
+            }
+        }
         if (!isFirstInstance)
         {
+            if (_startedByRecycle)
+                StartupLog.Write("Reciclagem: instancia antiga nao saiu a tempo, desistindo");
             Shutdown();
             return;
         }
@@ -97,111 +138,138 @@ public partial class App : Application
             StartupLog.WriteException("UnobservedTaskException", args.Exception);
 
         AppPaths.EnsureCreated();
-        // RF-P3.05: --verbose liga o log de alta frequencia (ingestao, estado dos hooks).
-        // Desligado por padrao: em uso normal o log so registra transicoes e erros.
+        // --verbose turns on the chatty log (ingest, hook state) and keeps the ui
+        // watchdog running. Off by default: normal use only logs transitions and errors
         StartupLog.VerboseEnabled = e.Args.Contains("--verbose");
         StartupLog.Write("OnStartup: iniciando");
+        // a child inherits IDLE/BELOW_NORMAL from whoever launched it (editor, script);
+        // in idle class the ui thread loses the cpu to any normal load at hotkey time
+        if (PowerEfficiency.NormalizePriorityClass() is { } inherited)
+            StartupLog.Write($"OnStartup: classe de prioridade herdada 0x{inherited:X} corrigida para Normal");
 
-        // ADR-P.08: o app nasce ocioso na bandeja. EcoQoS pede frequencia eficiente e
-        // agendamento em efficient cores INCLUSIVE na tomada (o nivel Low automatico por
-        // visibilidade so vale na bateria). Prioridade de memoria baixa faz o gerenciador
-        // aparar as NOSSAS paginas antes das dos outros sob pressao - alternativa correta
-        // e nao destrutiva ao EmptyWorkingSet.
-        PowerEfficiency.SetProcessMemoryPriorityLow();
-        PowerEfficiency.EnterProcessEcoQos();
+        // idle in the tray is not the same as background work: the next hotkey has to be
+        // instant. memory priority stays normal and the qos goes back to the system
+        // (which still applies eco on battery for a hidden process). low memory priority
+        // plus eco at rest made windows page us out first, and after an hour or two away
+        // the first Win+V paid seconds of page faults. eco + low now only while a game or
+        // fullscreen app has the machine (SystemActivityMonitor).
+        PowerEfficiency.ResetProcessQosToSystem();
+        // Pisa um piso pequeno que o trimmer nao derruba; escala com a RAM da maquina
+        // e fica em zero em PCs fracos (ver NativeMethods.PinWorkingSetFloor).
+        if (NativeMethods.PinWorkingSetFloor())
+            StartupLog.WriteVerbose("Memoria: piso de working set travado");
         // Defesa contra dependencia que chame timeBeginPeriod: no Win11 o efeito e por
         // processo e some quando estamos ocultos, mas o custo de troca de contexto fica.
         PowerEfficiency.IgnoreTimerResolutionRequests(true);
 
-        // ADR-P.01: sobe a thread dedicada dos hooks LL ja no startup. Nenhum hook e
-        // instalado aqui - so o pump fica pronto, para o primeiro Acquire ser instantaneo.
-        LowLevelHookHost.Shared.Start();
+        // the LL hook thread now starts at idle (see WarmUpAtIdle), Acquire also starts
+        // it on demand. One less thread in the startup path
 
-        var builder = Host.CreateApplicationBuilder();
-        builder.Services.AddSingleton<SettingsService>();
-        builder.Services.AddSingleton(_ =>
+        var services = new ServiceCollection();
+        services.AddSingleton<SettingsService>();
+        services.AddSingleton(_ =>
         {
             var db = new Database(AppPaths.DatabaseFile);
             db.Initialize();
             return db;
         });
-        builder.Services.AddSingleton<ClipboardItemRepository>();
-        builder.Services.AddSingleton<MediaStore>();
-        builder.Services.AddSingleton<BackupService>();
-        builder.Services.AddSingleton<Klip.Core.Storage.IThumbnailGenerator, WpfThumbnailGenerator>();
-        builder.Services.AddSingleton<OcrService>();
-        builder.Services.AddSingleton<Klip.Core.Storage.IImageTextExtractor>(sp => sp.GetRequiredService<OcrService>());
-        builder.Services.AddSingleton<ClipboardIngestService>(sp => new ClipboardIngestService(
+        services.AddSingleton<ClipboardItemRepository>();
+        services.AddSingleton<MediaStore>();
+        services.AddSingleton<BackupService>();
+        services.AddSingleton<Klip.Core.Storage.IThumbnailGenerator, WpfThumbnailGenerator>();
+        services.AddSingleton<OcrService>();
+        services.AddSingleton<Klip.Core.Storage.IImageTextExtractor>(sp => sp.GetRequiredService<OcrService>());
+        // the OCR engine itself only loads on the first image (OcrService is lazy)
+        services.AddSingleton<ClipboardIngestService>(sp => new ClipboardIngestService(
             sp.GetRequiredService<ClipboardItemRepository>(),
             sp.GetRequiredService<MediaStore>(),
             sp.GetRequiredService<SettingsService>(),
             sp.GetRequiredService<Klip.Core.Storage.IThumbnailGenerator>(),
-            sp.GetRequiredService<Klip.Core.Storage.IImageTextExtractor>()));
-        // ADR-P.05: thread STA dedicada dona de todo acesso ao clipboard. Precisa vir
+            sp.GetRequiredService<Klip.Core.Storage.IImageTextExtractor>(),
+            System.IO.Path.Combine(AppPaths.Root, "secrets-pending.txt")));
+        services.AddSingleton(_ => new MemorySettler(Dispatcher));
+        // thread STA dedicada dona de todo acesso ao clipboard. Precisa vir
         // antes do WriteGuard/Monitor, que a recebem por injecao.
-        builder.Services.AddSingleton<ClipboardThread>();
-        builder.Services.AddSingleton<ClipboardWriteGuard>();
-        builder.Services.AddSingleton<ClipboardMonitorService>();
-        builder.Services.AddSingleton<PasteService>();
-        builder.Services.AddSingleton<PasteQueueService>();
-        builder.Services.AddSingleton<ScreenCaptureService>();
-        builder.Services.AddSingleton<PanoramicCaptureService>();
-        // gravacao (specs F3/F4): concretas do Interop so via factory (ponto unico)
-        builder.Services.AddSingleton(sp => new RecordingController(
+        services.AddSingleton<ClipboardThread>();
+        services.AddSingleton<ClipboardWriteGuard>();
+        services.AddSingleton<ClipboardMonitorService>();
+        services.AddSingleton<ExplorerPasteService>();
+        services.AddSingleton<PasteService>();
+        services.AddSingleton<PasteQueueService>();
+        services.AddSingleton<PickPasteService>();
+        services.AddSingleton<ScreenCaptureService>();
+        services.AddSingleton<PanoramicCaptureService>();
+        // recording: concrete interop types only through the factory
+        services.AddSingleton(sp => new RecordingController(
             sp.GetRequiredService<SettingsService>(),
             sp.GetRequiredService<ClipboardIngestService>(),
             sp.GetRequiredService<HotkeyService>(),
             RecordingInteropFactory.CreateAudioDeviceEnumerator,
             RecordingInteropFactory.CreateMp4Recorder));
-        builder.Services.AddSingleton<CaptureController>();
-        builder.Services.AddSingleton<AutostartService>();
-        builder.Services.AddSingleton<HotkeyService>();
-        builder.Services.AddSingleton<SystemHotkeyService>();
-        builder.Services.AddSingleton<HistoryFlyoutViewModel>();
-        builder.Services.AddSingleton<HistoryFlyoutWindow>();
-        // RF-P1.06 / RF-P0.02: rede de seguranca e instrumentacao.
-        builder.Services.AddSingleton<SystemActivityMonitor>();
-        builder.Services.AddSingleton(_ => new UiThreadWatchdog(Dispatcher));
-        builder.Services.AddTransient<EditorWindow>(); // one window per edit
-        // ADR-S.03 / RF-S.04: tela de Configuracoes redesenhada. O provider resolve as
+        services.AddSingleton<CaptureController>();
+        services.AddSingleton<PinnedImageService>();
+        services.AddSingleton<AutostartService>();
+        services.AddSingleton<HotkeyService>();
+        services.AddSingleton<SystemHotkeyService>();
+        services.AddSingleton<Klip.Core.Storage.SnippetRepository>();
+        services.AddSingleton(_ => new HistoryPause());
+        services.AddSingleton<HistoryFlyoutViewModel>();
+        services.AddSingleton<HistoryFlyoutWindow>();
+        // fullscreen guard and ui latency probe, both only alive with a hook scope
+        services.AddSingleton<SystemActivityMonitor>();
+        services.AddSingleton(_ => new UiThreadWatchdog(Dispatcher));
+        services.AddTransient<EditorWindow>(); // one window per edit
+        // tela de Configuracoes: o provider resolve as
         // paginas pelo container; com ele ligado o NavigationCacheMode vira codigo
         // morto e o ciclo de vida passa a ser do DI - Singleton = construida na
         // primeira navegacao e reusada, sem reconstruir ao voltar.
-        builder.Services.AddSingleton<INavigationViewPageProvider, NavigationPageProvider>();
-        builder.Services.AddSingleton<SettingsShell>();
-        builder.Services.AddSingleton<GeneralPage>();
-        builder.Services.AddSingleton<HotkeysPage>();
-        builder.Services.AddSingleton<ClipboardPage>();
-        builder.Services.AddSingleton<CapturePage>();
-        builder.Services.AddSingleton<PrivacyPage>();
-        builder.Services.AddSingleton<MaintenancePage>();
-        builder.Services.AddSingleton<AboutPage>();
-        _host = builder.Build();
-        _host.Start();
-        StartupLog.Write("OnStartup: host iniciado");
+        services.AddSingleton<INavigationViewPageProvider, NavigationPageProvider>();
+        services.AddSingleton<SettingsShell>();
+        services.AddSingleton<GeneralPage>();
+        services.AddSingleton<HotkeysPage>();
+        services.AddSingleton<ClipboardPage>();
+        services.AddSingleton<CapturePage>();
+        services.AddSingleton<RecordingPage>();
+        services.AddSingleton<PrivacyPage>();
+        services.AddSingleton<MaintenancePage>();
+        services.AddSingleton<AboutPage>();
+        // plain container, nothing here needs config, logging or hosted services
+        _services = services.BuildServiceProvider();
+        StartupLog.Write("OnStartup: container pronto");
 
-        // RF-P0.02: mede a latencia da UI thread. Um bloqueio longo aqui e o que
-        // congela o input do sistema quando ha hook LL instalado.
-        _uiWatchdog = _host.Services.GetRequiredService<UiThreadWatchdog>();
-        _uiWatchdog.Start();
-
-        // RF-P1.06: polling de 3 s. O Windows NAO notifica entrada/saida de app em
-        // tela cheia (doc de SHQueryUserNotificationState), entao polling e obrigatorio.
-        _activityMonitor = _host.Services.GetRequiredService<SystemActivityMonitor>();
+        // the watchdog measures ui thread latency: a long block there is what freezes
+        // system input while a LL hook is installed. The activity monitor polls for
+        // fullscreen games (Windows has no event for it). Both only matter while a
+        // hook scope is alive, so at idle the process has no periodic timer at all
+        _uiWatchdog = _services.GetRequiredService<UiThreadWatchdog>();
+        _activityMonitor = _services.GetRequiredService<SystemActivityMonitor>();
         _activityMonitor.StateChanged += state =>
             Dispatcher.BeginInvoke(new Action(() => OnActivityStateChanged(state)));
-        _activityMonitor.Start();
+        if (StartupLog.VerboseEnabled)
+            _uiWatchdog.Start();
+        LowLevelHookHost.Shared.ScopeActiveChanged += OnHookScopeActiveChanged;
+        _memory = _services.GetRequiredService<MemorySettler>();
+        _idleRecycler = new IdleRecycler(Dispatcher, _services.GetRequiredService<SettingsService>(),
+            IsBusyForRecycle, RecycleProcess);
+        // any window opening or closing counts as using the app (editor, overlay, pinned image...)
+        EventManager.RegisterClassHandler(typeof(Window), FrameworkElement.LoadedEvent,
+            new RoutedEventHandler((_, _) => _idleRecycler?.NoteActivity()));
+        EventManager.RegisterClassHandler(typeof(Window), FrameworkElement.UnloadedEvent,
+            new RoutedEventHandler((_, _) => _idleRecycler?.NoteActivity()));
+        // modern standby/sleep freezes the whole process, and whatever the page cache
+        // had warm is anyone's guess by the time it thaws
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
-        var settings = _host.Services.GetRequiredService<SettingsService>();
+        var settings = _services.GetRequiredService<SettingsService>();
 
         // resolve language before any window shows up (default: Windows)
         Localization.Loc.Initialize(settings.Current.Language);
-        ThemeManager.Apply(settings.Current.Theme);
+        ThemeManager.ApplyAtStartup(settings.Current.Theme);
 
         // autostart following the saved setting
         try
         {
-            _host.Services.GetRequiredService<AutostartService>().SetEnabled(settings.Current.StartWithWindows);
+            _services.GetRequiredService<AutostartService>().SetEnabled(settings.Current.StartWithWindows);
         }
         catch (Exception ex)
         {
@@ -209,52 +277,79 @@ public partial class App : Application
             StartupLog.WriteException("Autostart", ex);
         }
 
-        // ADR-S.01: a tela de Configuracoes NAO e mais construida no startup. A antiga
+        // a tela de Configuracoes NAO e construida no startup. A antiga
         // MainWindow montava ~247 elementos e 31 cards mesmo com o app iniciando
         // minimizado - o UiThreadWatchdog media 793 ms de UI thread travada por causa
         // disso. Agora a janela nasce na primeira abertura (ver ShowMainWindow).
         // O banco continua sendo inicializado aqui perto, pelo ClipboardMonitorService.
 
         // clipboard engine + flyout
-        _pasteService = _host.Services.GetRequiredService<PasteService>();
+        _pasteService = _services.GetRequiredService<PasteService>();
         // warn when paste fails (item stays copied at least)
         _pasteService.PasteFailed += () =>
             _tray?.ShowNotification("Klip", Loc.PasteFailedToast);
-        _flyout = _host.Services.GetRequiredService<HistoryFlyoutWindow>();
-        // ADR-P.08: o flyout fecha por varios caminhos (Esc, clique fora, colar,
+        _pasteService.TypingStopped += () =>
+            _tray?.ShowNotification("Klip", Loc.TypingStoppedToast);
+        _flyout = _services.GetRequiredService<HistoryFlyoutWindow>();
+        // o flyout fecha por varios caminhos (Esc, clique fora, colar,
         // hotkey). Ao inves de espalhar EnterProcessEcoQos por todos eles, reage a
         // visibilidade: sem janela visivel, o app volta ao estado de repouso.
-        _flyout.IsVisibleChanged += (_, _) => ApplyIdleQosIfNoWindowVisible();
-        _clipboardMonitor = _host.Services.GetRequiredService<ClipboardMonitorService>();
+        _flyout.IsVisibleChanged += (_, _) =>
+        {
+            ApplyIdleQosIfNoWindowVisible();
+            ShowSequenceTicket();
+        };
+        _clipboardMonitor = _services.GetRequiredService<ClipboardMonitorService>();
         StartupLog.Write("OnStartup: clipboard monitor ativo");
+        if (_startedByRecycle)
+        {
+            // a copy made while the old instance was leaving never got a listener
+            var changed = NativeMethods.GetClipboardSequenceNumber() != _recycledClipboardSequence;
+            if (changed)
+                _clipboardMonitor.ProcessCurrentClipboard();
+            StartupLog.Write($"Reciclagem: instancia nova assumiu (clipboard mudou na troca: {(changed ? "sim" : "nao")})");
+        }
 
-        // indicator for the sequential paste queue
-        var pasteQueue = _host.Services.GetRequiredService<PasteQueueService>();
+        // timed pause and "ignore the next copy" feed the monitor; the one-shot timer lives in HistoryPause
+        var monitor = _clipboardMonitor;
+        var historyPause = _services.GetRequiredService<HistoryPause>();
+        monitor.SkipCopy = historyPause.TryConsumeIgnoreNext;
+        historyPause.Changed += () => monitor.IsPaused = historyPause.IsPaused;
+        _services.GetRequiredService<HistoryFlyoutViewModel>().OpenSettingsRequested += ShowMainWindow;
+        Views.Controls.PasteAsFileSettings.SettingsSource = settings;
+        _services.GetRequiredService<ExplorerPasteService>().Start();
+
+        // indicator for the sequential paste queue: tray tooltip, plus the ticket by the
+        // caret once the history panel is out of the way
+        var pasteQueue = _services.GetRequiredService<PasteQueueService>();
         pasteQueue.QueueProgress += (current, total) =>
             Dispatcher.BeginInvoke(() =>
             {
                 if (_tray is not null)
-                    _tray.ToolTipText = $"Klip - colando {current} de {total}";
+                    _tray.ToolTipText = string.Format(Localization.Loc.QueueTrayProgress, current, total);
+                ShowSequenceTicket();
             });
         pasteQueue.QueueFinished += () =>
             Dispatcher.BeginInvoke(() =>
             {
                 if (_tray is not null)
                     _tray.ToolTipText = "Klip";
+                _sequenceTicket?.Hide();
             });
 
         // capture overlay
-        _captureController = _host.Services.GetRequiredService<CaptureController>();
+        _captureController = _services.GetRequiredService<CaptureController>();
         _captureController.CaptureCompleted += message =>
         {
             _recordingToastFolder = null; // o clique volta a abrir o editor
             _recordingToastFile = null;
             _tray?.ShowNotification("Klip", message);
         };
-        _captureController.EditRequested += OpenEditor; // scroll capture opens in the editor
+        // the editor gets the bitmap straight from memory, no reread of the png
+        _captureController.EditImageRequested += OpenEditor;
 
-        // gravacao GIF/MP4 (specs F3/F4): toasts + estado no tray
-        _recordingController = _host.Services.GetRequiredService<RecordingController>();
+        // gravacao GIF/MP4: toasts + estado no tray
+        _recordingController = _services.GetRequiredService<RecordingController>();
         _recordingController.RecordingToast += (message, folder, editorFile) =>
         {
             // estado do toast anterior nao vaza para o clique deste (limpa e
@@ -263,10 +358,17 @@ public partial class App : Application
             _recordingToastFile = editorFile; // MP4: clique abre o editor de midia
             _tray?.ShowNotification("Klip", message);
         };
-        // RF-F3.04: tooltip do tray com o timer enquanto grava (tick de 1 s)
+        // tooltip do tray com o timer enquanto grava (tick de 1 s)
+        var wasRecording = false;
         _recordingController.StateChanged += () =>
         {
-            if (_tray is null || _recordingController is null)
+            if (_recordingController is null)
+                return;
+            // recording just ended: frames, encoder buffers and D3D go back with a GC
+            if (wasRecording && !_recordingController.IsActive)
+                _memory?.Schedule();
+            wasRecording = _recordingController.IsActive;
+            if (_tray is null)
                 return;
             _tray.ToolTipText = _recordingController.IsActive
                 ? string.Format(Loc.TrayRecordingTooltip, _recordingController.Elapsed.ToString(@"mm\:ss"))
@@ -274,23 +376,39 @@ public partial class App : Application
         };
 
         // editor: opened from the flyout and from the toast
-        _host.Services.GetRequiredService<HistoryFlyoutViewModel>().OpenInEditorRequested += OpenEditor;
+        _services.GetRequiredService<HistoryFlyoutViewModel>().OpenInEditorRequested += OpenEditor;
 
-        // editor de midia (spec F5): registra o gateway para historico/toasts
+        // editor de midia: registra o gateway para historico/toasts
         MediaEditorGateway.Opener = path => Dispatcher.BeginInvoke(() => OpenMediaEditor(path));
 
-        RegisterHotkeys(settings);
+        // tray first: a hotkey that fails to register warns through it
         CreateTrayIcon();
+        RegisterHotkeys(settings);
         StartupLog.Write("OnStartup: tray e hotkeys prontos");
-        // RF-P0.01 / CA-P1.3: em idle nenhum hook LL pode estar instalado
+        CheckTakeover("startup");
+        WatchSessionEvents();
+        // em idle nenhum hook LL pode estar instalado
         StartupLog.Write($"OnStartup: {HookHealth.FormatSummary()}");
 
         RunRetentionInBackground(settings);
 
-        // warm up the flyout at idle so the first Win+V opens instantly (pre-pays
-        // the first layout and the Mica composition without the user seeing it)
-        Dispatcher.BeginInvoke(new Action(() => _flyout?.WarmUp()),
-            System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        // secrets a crashed run left behind (SecretKeepSeconds) go away now
+        var ingest = _services.GetRequiredService<ClipboardIngestService>();
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var wiped = ingest.PurgeSecretLeftovers();
+                if (wiped > 0)
+                    StartupLog.Write($"Segredos: {wiped} pendente(s) da sessao anterior apagado(s)");
+            }
+            catch (Exception ex)
+            {
+                StartupLog.WriteException("SecretLeftovers", ex);
+            }
+        });
+
+        WarmUpAtIdle();
 
         // onboarding na primeira execucao (passa por cima do start minimizado)
         if (!settings.Current.OnboardingCompleted)
@@ -313,7 +431,7 @@ public partial class App : Application
 
     private void HandleElevatedRegistryOperation(string operation)
     {
-        // RF-P3.06: este processo faz uma operacao e morre. O Update do SettingsService
+        // este processo faz uma operacao e morre. O Update do SettingsService
         // agora tem debounce de 500 ms, entao a instancia precisa ser descartada
         // explicitamente (Dispose faz Flush) antes do Shutdown, senao a escrita se perde.
         using var settings = new SettingsService();
@@ -350,7 +468,7 @@ public partial class App : Application
     /// </summary>
     private void RevertRegistrySilently()
     {
-        // RF-P3.06: mesmo motivo do metodo acima - o processo morre logo em seguida.
+        // mesmo motivo do metodo acima - o processo morre logo em seguida.
         using var settings = new SettingsService();
         try
         {
@@ -376,13 +494,23 @@ public partial class App : Application
 
     private int _historyHotkeyId;
     private int _captureHotkeyId;
-    private int _captureRectangleHotkeyId;
-    private int _captureGifHotkeyId;
+
+    // some configured hotkey did not register; retried on resume, unlock and Explorer restart
+    private bool _hotkeysIncomplete;
+    private bool _quietHotkeyRetry;
+    private readonly HashSet<string> _conflictNotified = new(StringComparer.OrdinalIgnoreCase);
+
+    // a system hotkey we took over (Win+V, PrintScreen) went back to Windows; warned once each
+    private readonly HashSet<string> _takeoverLostNotified = new(StringComparer.OrdinalIgnoreCase);
+    // a balloon click within this window means the takeover warning, not the last capture
+    private DateTime _takeoverToastUtc = DateTime.MinValue;
+    // text, repeat region and record video: empty by default, registered only when set
+    private readonly List<int> _optionalHotkeyIds = [];
 
     /// <summary>(Re)applies the global hotkeys from settings.</summary>
     public bool ApplyHotkeys(SettingsService settings)
     {
-        var hotkeys = _host!.Services.GetRequiredService<HotkeyService>();
+        var hotkeys = _services!.GetRequiredService<HotkeyService>();
 
         if (_historyHotkeyId != 0)
         {
@@ -394,16 +522,9 @@ public partial class App : Application
             hotkeys.Unregister(_captureHotkeyId);
             _captureHotkeyId = 0;
         }
-        if (_captureRectangleHotkeyId != 0)
-        {
-            hotkeys.Unregister(_captureRectangleHotkeyId);
-            _captureRectangleHotkeyId = 0;
-        }
-        if (_captureGifHotkeyId != 0)
-        {
-            hotkeys.Unregister(_captureGifHotkeyId);
-            _captureGifHotkeyId = 0;
-        }
+        foreach (var id in _optionalHotkeyIds)
+            hotkeys.Unregister(id);
+        _optionalHotkeyIds.Clear();
 
         var allOk = true;
 
@@ -419,32 +540,34 @@ public partial class App : Application
 
         if (HotkeyGesture.TryParse(settings.Current.HotkeyCapture, out var captureGesture))
         {
-            if (!hotkeys.TryRegister(captureGesture, StartCapture, out _captureHotkeyId))
+            if (!hotkeys.TryRegister(captureGesture, CaptureFromHotkey(settings.Current.HotkeyCapture), out _captureHotkeyId))
             {
                 NotifyHotkeyConflict(captureGesture);
                 allOk = false;
             }
         }
 
-        if (HotkeyGesture.TryParse(settings.Current.HotkeyCaptureRectangle, out var rectangleGesture))
-        {
-            if (!hotkeys.TryRegister(rectangleGesture, () => StartCapture(CaptureMode.Rectangle), out _captureRectangleHotkeyId))
-            {
-                NotifyHotkeyConflict(rectangleGesture);
-                allOk = false;
-            }
-        }
+        var current = settings.Current;
+        allOk &= TryRegisterOptional(hotkeys, current.HotkeyCaptureText, () => StartCaptureIn(CaptureMode.Text));
+        allOk &= TryRegisterOptional(hotkeys, current.HotkeyRepeatRegion, RepeatLastRegion);
+        allOk &= TryRegisterOptional(hotkeys, current.HotkeyRecordVideo, () => StartCaptureIn(CaptureMode.Mp4));
+        allOk &= TryRegisterOptional(hotkeys, current.HotkeyCaptureRectangle, () => StartCaptureIn(CaptureMode.Rectangle));
 
-        if (HotkeyGesture.TryParse(settings.Current.HotkeyCaptureGif, out var gifGesture))
-        {
-            if (!hotkeys.TryRegister(gifGesture, () => StartCapture(CaptureMode.Gif), out _captureGifHotkeyId))
-            {
-                NotifyHotkeyConflict(gifGesture);
-                allOk = false;
-            }
-        }
-
+        _hotkeysIncomplete = !allOk;
         return allOk;
+    }
+
+    private bool TryRegisterOptional(HotkeyService hotkeys, string text, Action callback)
+    {
+        if (!HotkeyGesture.TryParse(text, out var gesture))
+            return true; // not set, nothing to register
+        if (hotkeys.TryRegister(gesture, callback, out var id))
+        {
+            _optionalHotkeyIds.Add(id);
+            return true;
+        }
+        NotifyHotkeyConflict(gesture);
+        return false;
     }
 
     /// <summary>
@@ -453,8 +576,8 @@ public partial class App : Application
     /// </summary>
     public async Task<string> TakeoverWinVAsync()
     {
-        var settings = _host!.Services.GetRequiredService<SettingsService>();
-        var registry = _host.Services.GetRequiredService<SystemHotkeyService>();
+        var settings = _services!.GetRequiredService<SettingsService>();
+        var registry = _services!.GetRequiredService<SystemHotkeyService>();
 
         registry.AddDisabledHotkeyLetters("V");
         await SystemHotkeyService.RestartExplorerAsync();
@@ -472,7 +595,7 @@ public partial class App : Application
     /// <summary>Elevated fallback: kills the native history feature.</summary>
     public async Task<string> TakeoverWinVWithHklmFallbackAsync()
     {
-        var settings = _host!.Services.GetRequiredService<SettingsService>();
+        var settings = _services!.GetRequiredService<SettingsService>();
 
         if (!SystemHotkeyService.RunElevated("clipboard-feature-off"))
             return "uac-cancelado";
@@ -490,8 +613,8 @@ public partial class App : Application
     /// <summary>The recommended route: Print Screen opens capture.</summary>
     public string TakeoverPrintScreen()
     {
-        var settings = _host!.Services.GetRequiredService<SettingsService>();
-        var registry = _host.Services.GetRequiredService<SystemHotkeyService>();
+        var settings = _services!.GetRequiredService<SettingsService>();
+        var registry = _services!.GetRequiredService<SystemHotkeyService>();
 
         registry.SetPrintScreenFreed(true);
         settings.UpdateAndFlush(s => s.HotkeyCapture = "PrintScreen");
@@ -501,8 +624,8 @@ public partial class App : Application
     /// <summary>Win+Shift+S route (desativa o Win+S junto, avisar antes).</summary>
     public async Task<string> TakeoverWinShiftSAsync()
     {
-        var settings = _host!.Services.GetRequiredService<SettingsService>();
-        var registry = _host.Services.GetRequiredService<SystemHotkeyService>();
+        var settings = _services!.GetRequiredService<SettingsService>();
+        var registry = _services!.GetRequiredService<SystemHotkeyService>();
 
         registry.AddDisabledHotkeyLetters("S");
         await SystemHotkeyService.RestartExplorerAsync();
@@ -515,11 +638,135 @@ public partial class App : Application
         return "falhou";
     }
 
+    /// <summary>
+    /// The one way the settings page changes a shortcut. Picking a key Windows owns
+    /// (Win+V, Win+Shift+S, Print Screen) takes it over in the registry; moving off one
+    /// gives that key alone back. Used to be two controls (the shortcut field and the
+    /// takeover buttons) that could disagree: typing Win+Shift+S in the field saved it
+    /// without freeing it from Windows, and leaving Print Screen kept it freed for nobody.
+    /// Returns "ok", "conflito", "precisa-hklm" (Win+V on 24H2) or "falhou".
+    /// </summary>
+    public async Task<string> ChangeShortcutAsync(string slot, string gesture)
+    {
+        var settings = _services!.GetRequiredService<SettingsService>();
+        var registry = _services!.GetRequiredService<SystemHotkeyService>();
+
+        string Get(AppSettings s) => slot switch
+        {
+            "history" => s.HotkeyHistory,
+            "capture" => s.HotkeyCapture,
+            "stop" => s.StopRecordingHotkey,
+            "text" => s.HotkeyCaptureText,
+            "repeat" => s.HotkeyRepeatRegion,
+            "video" => s.HotkeyRecordVideo,
+            "rectangle" => s.HotkeyCaptureRectangle,
+            _ => throw new ArgumentOutOfRangeException(nameof(slot), slot, null),
+        };
+        void Set(AppSettings s, string g)
+        {
+            switch (slot)
+            {
+                case "history": s.HotkeyHistory = g; break;
+                case "capture": s.HotkeyCapture = g; break;
+                case "stop": s.StopRecordingHotkey = g; break;
+                case "text": s.HotkeyCaptureText = g; break;
+                case "repeat": s.HotkeyRepeatRegion = g; break;
+                case "video": s.HotkeyRecordVideo = g; break;
+                case "rectangle": s.HotkeyCaptureRectangle = g; break;
+            }
+        }
+
+        var old = Get(settings.Current);
+        if (string.Equals(old, gesture, StringComparison.OrdinalIgnoreCase))
+        {
+            ApplyHotkeys(settings);
+            return "ok";
+        }
+
+        var state = await Task.Run(registry.GetState);
+        var restartExplorer = false;
+
+        // take the new key from Windows when it is one of its own
+        if (SystemKeyLetter(gesture) is { } takeLetter &&
+            !(takeLetter == 'V' ? state.WinVFreed || state.HklmClipboardFeatureOff : state.WinSFreed))
+        {
+            registry.AddDisabledHotkeyLetters(takeLetter.ToString());
+            restartExplorer = true;
+        }
+        if (IsPrintScreen(gesture) && !state.PrintScreenFreed)
+            registry.SetPrintScreenFreed(true);
+
+        settings.UpdateAndFlush(s => Set(s, gesture));
+
+        // give the old key back, unless another action still uses it
+        var stillUsed = UsesGesture(settings.Current, old);
+        if (!stillUsed && SystemKeyLetter(old) is { } giveLetter && registry.RemoveDisabledHotkeyLetter(giveLetter))
+            restartExplorer = true;
+        if (!stillUsed && IsPrintScreen(old))
+            registry.SetPrintScreenFreed(false);
+
+        if (restartExplorer)
+            await SystemHotkeyService.RestartExplorerAsync();
+
+        // the stop recording key is only registered during a recording
+        if (slot == "stop")
+            return "ok";
+
+        // after an Explorer restart the shell may hold the key for a few seconds
+        var deadline = DateTime.UtcNow.AddSeconds(restartExplorer ? 10 : 0);
+        while (true)
+        {
+            if (ApplyHotkeys(settings))
+                return "ok";
+            if (DateTime.UtcNow >= deadline)
+                break;
+            await Task.Delay(400);
+        }
+
+        // Win+V on Windows 11 24H2 only lets go with the feature off in HKLM (elevated)
+        if (slot == "history" && gesture == "Win+V" && !settings.Current.RegistryHklmClipboardOffApplied)
+            return "precisa-hklm";
+        return SystemKeyLetter(gesture) is not null ? "falhou" : "conflito";
+    }
+
+    /// <summary>
+    /// Unregisters every Klip hotkey while the shortcut dialog listens, so pressing
+    /// the current Win+V reaches the dialog instead of opening the panel. ApplyHotkeys
+    /// puts them back.
+    /// </summary>
+    public void SuspendHotkeys()
+    {
+        var hotkeys = _services?.GetService<HotkeyService>();
+        if (hotkeys is null)
+            return;
+        if (_historyHotkeyId != 0) { hotkeys.Unregister(_historyHotkeyId); _historyHotkeyId = 0; }
+        if (_captureHotkeyId != 0) { hotkeys.Unregister(_captureHotkeyId); _captureHotkeyId = 0; }
+        foreach (var id in _optionalHotkeyIds)
+            hotkeys.Unregister(id);
+        _optionalHotkeyIds.Clear();
+    }
+
+    private static char? SystemKeyLetter(string? gesture) => gesture switch
+    {
+        "Win+V" => 'V',
+        "Win+Shift+S" or "Shift+Win+S" => 'S',
+        _ => null,
+    };
+
+    private static bool IsPrintScreen(string? gesture) =>
+        string.Equals(gesture, "PrintScreen", StringComparison.OrdinalIgnoreCase);
+
+    private static bool UsesGesture(AppSettings s, string? gesture) =>
+        !string.IsNullOrEmpty(gesture) &&
+        new[] { s.HotkeyHistory, s.HotkeyCapture, s.HotkeyCaptureText, s.HotkeyRepeatRegion, s.HotkeyRecordVideo,
+            s.HotkeyCaptureRectangle, s.StopRecordingHotkey }
+            .Any(g => string.Equals(g, gesture, StringComparison.OrdinalIgnoreCase));
+
     /// <summary>Full rollback of every takeover.</summary>
     public async Task RevertTakeoversAsync()
     {
-        var settings = _host!.Services.GetRequiredService<SettingsService>();
-        var registry = _host.Services.GetRequiredService<SystemHotkeyService>();
+        var settings = _services!.GetRequiredService<SettingsService>();
+        var registry = _services!.GetRequiredService<SystemHotkeyService>();
 
         registry.RestoreDisabledHotkeys();
         registry.SetPrintScreenFreed(false);
@@ -542,7 +789,7 @@ public partial class App : Application
     /// <summary>Retry loop after the Explorer restart (it may grab the hotkey again while the shell boots).</summary>
     private async Task<bool> TryRegisterWithRetryAsync(string gestureText, Action callback, bool isHistory)
     {
-        var hotkeys = _host!.Services.GetRequiredService<HotkeyService>();
+        var hotkeys = _services!.GetRequiredService<HotkeyService>();
         if (!HotkeyGesture.TryParse(gestureText, out var gesture))
             return false;
 
@@ -574,26 +821,43 @@ public partial class App : Application
         return false;
     }
 
-    /// <summary>Opens the capture overlay, optionally straight in one mode.</summary>
-    private void StartCapture() => StartCapture(null);
+    /// <summary>Opens the capture overlay.</summary>
+    private void StartCapture() => StartCaptureIn(null);
 
-    private void StartCapture(CaptureMode? mode)
+    // the Print Screen key always opens on rectangle, like the Snipping Tool
+    private Action CaptureFromHotkey(string gesture) =>
+        IsPrintScreen(gesture) ? () => StartCaptureIn(CaptureMode.Rectangle) : StartCapture;
+
+    private void RepeatLastRegion()
     {
+        if (IsExiting)
+            return;
+        _flyout?.HideFlyout();
+        _captureController?.RepeatLastRegion();
+    }
+
+    private void StartCaptureIn(CaptureMode? mode)
+    {
+        var latency = HotkeyLatency.Begin("captura");
         // Aqui NAO ha bloqueio por jogo em tela cheia de proposito. Capturar um jogo ou
         // um video em tela cheia e caso de uso primario de uma ferramenta de captura;
         // recusar a hotkey seria uma regressao muito pior do que o custo de composicao
         // de um overlay que o usuario acabou de pedir. O que a auto-suspensao corta e o
-        // custo em REPOUSO (RF-P1.06), nao acao explicita do usuario.
+        // custo em REPOUSO, nao acao explicita do usuario.
         if (_activityMonitor?.State == SystemActivityState.Suspended)
             StartupLog.WriteVerbose("Captura sobre app em tela cheia (a pedido do usuario)");
 
+        _idleRecycler?.NoteActivity();
         _flyout?.HideFlyout(); // overlay cant capture the flyout while its open
-        PowerEfficiency.EnterProcessHighQos(); // ADR-P.08: UI a frente, sai do Eco
-        _captureController?.StartCapture(mode);
+        PowerEfficiency.EnterProcessHighQos(); // UI a frente, sai do Eco
+        PowerEfficiency.SetProcessMemoryPriorityNormal();
+        _activityMonitor?.RecheckSoon();
+        if (_captureController?.StartCapture(mode) == true)
+            latency.End();
     }
 
     /// <summary>
-    /// RF-P1.06 / ADR-P.07: reage a entrada e saida de jogo em tela cheia. O
+    /// Reage a entrada e saida de jogo em tela cheia. O
     /// SystemActivityMonitor ja removeu os hooks LL ociosos e aplicou EcoQoS na thread
     /// dele; aqui cuidamos apenas do que precisa da UI thread.
     ///
@@ -612,7 +876,7 @@ public partial class App : Application
         _ = state;
     }
 
-    /// <summary>Abre a pasta de gravacoes no Explorer (acao do toast, RF-F3.16).</summary>
+    /// <summary>Abre a pasta de gravacoes no Explorer (acao do toast).</summary>
     private static void OpenFolder(string folder)
     {
         try
@@ -630,12 +894,14 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// ADR-P.08: devolve o processo ao EcoQoS quando nenhuma janela do Klip esta
-    /// visivel. Chamado pelas transicoes de visibilidade; e barato e idempotente.
-    /// Nao rebaixa enquanto houver gravacao em andamento nem durante o shutdown.
+    /// Leaves the high qos a window asked for once no Klip window is visible. At rest
+    /// the qos goes back to the system; eco only while a game or fullscreen app is in
+    /// front, same as the activity monitor does. Cheap and idempotent. Not while a
+    /// recording runs or during shutdown.
     /// </summary>
     private void ApplyIdleQosIfNoWindowVisible()
     {
+        _idleRecycler?.NoteActivity();
         if (IsExiting || _recordingController?.IsActive == true)
             return;
         foreach (Window window in Windows)
@@ -643,19 +909,36 @@ public partial class App : Application
             if (window.IsVisible)
                 return;
         }
-        PowerEfficiency.EnterProcessEcoQos();
+        if (_activityMonitor?.State == SystemActivityState.Suspended)
+            PowerEfficiency.EnterProcessEcoQos();
+        else
+            PowerEfficiency.ResetProcessQosToSystem();
     }
 
-    /// <summary>Opens the editor with an image from history or capture.</summary>
-    private void OpenEditor(ClipboardItem item)    {
-        if (item.FilePath is null || _host is null)
+    /// <summary>Opens the editor with an image from history (or the toast).</summary>
+    private void OpenEditor(ClipboardItem item)
+    {
+        if (item.FilePath is null || _services is null)
+            return;
+        var path = _services.GetRequiredService<MediaStore>().ToAbsolute(item.FilePath);
+        ShowEditor(editor => editor.OpenFromHistory(path));
+    }
+
+    /// <summary>Opens the editor with a capture that is still in memory.</summary>
+    private void OpenEditor(System.Windows.Media.Imaging.BitmapSource image) =>
+        ShowEditor(editor => editor.OpenImage(image));
+
+    private void ShowEditor(Action<EditorWindow> load)
+    {
+        if (_services is null)
             return;
         try
         {
-            PowerEfficiency.EnterProcessHighQos(); // ADR-P.08: janela a frente
-            var mediaStore = _host.Services.GetRequiredService<MediaStore>();
-            var editor = _host.Services.GetRequiredService<EditorWindow>();
-            editor.OpenFromHistory(mediaStore.ToAbsolute(item.FilePath));
+            PowerEfficiency.EnterProcessHighQos(); // janela a frente
+            var editor = _services.GetRequiredService<EditorWindow>();
+            load(editor);
+            // base image + undo bitmaps only go back with a GC
+            editor.Closed += (_, _) => _memory?.Schedule();
             editor.Show();
             editor.Activate();
         }
@@ -666,17 +949,22 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// Abre o editor de midia (spec F5): uma janela por arquivo; se ja existe
-    /// uma para o mesmo caminho, apenas reativa (RF-F5.16).
+    /// Abre o editor de midia: uma janela por arquivo; se ja existe
+    /// uma para o mesmo caminho, apenas reativa.
     /// </summary>
-    private void OpenMediaEditor(string filePath)
+    private void OpenMediaEditor(string filePath) => OpenMediaEditorWindow(filePath);
+
+    /// <summary>Item da bandeja: editor vazio, pronto para colar/arrastar video (sem gravacao previa).</summary>
+    private void OpenMediaEditorEmpty() => OpenMediaEditorWindow(null);
+
+    private void OpenMediaEditorWindow(string? filePath)
     {
-        if (_host is null)
+        if (_services is null)
             return;
         try
         {
-            PowerEfficiency.EnterProcessHighQos(); // ADR-P.08: janela a frente
-            if (_mediaEditors.TryGetValue(filePath, out var existing))
+            PowerEfficiency.EnterProcessHighQos(); // janela a frente
+            if (filePath is not null && _mediaEditors.TryGetValue(filePath, out var existing))
             {
                 existing.Show();
                 if (existing.WindowState == WindowState.Minimized)
@@ -686,12 +974,12 @@ public partial class App : Application
             }
 
             var window = new MediaEditorWindow(
-                _host.Services.GetRequiredService<SettingsService>(),
-                _host.Services.GetRequiredService<Klip.Core.Clipboard.ClipboardIngestService>());
+                _services.GetRequiredService<SettingsService>(),
+                _services.GetRequiredService<Klip.Core.Clipboard.ClipboardIngestService>());
             window.ExportCompleted += message => _tray?.ShowNotification("Klip", message);
             window.FileOpened += (w, path) =>
             {
-                // drag-and-drop trocou o arquivo: re-mapeia a janela
+                // drag-and-drop/colar trocou ou definiu o arquivo base: re-mapeia a janela
                 foreach (var stale in _mediaEditors.Where(kv => kv.Value == w).Select(kv => kv.Key).ToList())
                     _mediaEditors.Remove(stale);
                 _mediaEditors[path] = w;
@@ -700,8 +988,10 @@ public partial class App : Application
             {
                 foreach (var stale in _mediaEditors.Where(kv => kv.Value == window).Select(kv => kv.Key).ToList())
                     _mediaEditors.Remove(stale);
+                _memory?.Schedule(); // preview frame cache is big
             };
-            window.OpenFile(filePath);
+            if (filePath is not null)
+                window.OpenFile(filePath);
             window.Show();
             window.Activate();
         }
@@ -711,28 +1001,46 @@ public partial class App : Application
         }
     }
 
+    /// <summary>The "2/3" ticket shows while a sequence runs and the history panel is closed.</summary>
+    private void ShowSequenceTicket()
+    {
+        var queue = _services?.GetRequiredService<PasteQueueService>();
+        if (queue is null || !queue.IsArmed || _flyout is { IsVisible: true })
+        {
+            _sequenceTicket?.Hide();
+            return;
+        }
+        _sequenceTicket ??= new Windows.SequenceTicketWindow();
+        _sequenceTicket.ShowProgress(queue.Position, queue.Count);
+    }
+
     /// <summary>Grabs the target app before showing the flyout.</summary>
     private void ToggleHistoryFlyout()
     {
         if (_flyout is null)
             return;
-        // opening history cancels a paste queue that is running
-        _host?.Services.GetRequiredService<PasteQueueService>().Cancel();
+        _idleRecycler?.NoteActivity();
         if (_flyout.IsVisible)
         {
-            _flyout.HideFlyout();
-            PowerEfficiency.EnterProcessEcoQos(); // ADR-P.08: sem UI visivel, volta ao Eco
+            // closing with the hotkey keeps a pick, same as a click outside
+            _flyout.HideFlyout(); // IsVisibleChanged puts the qos back to rest
             return;
         }
-        // ADR-P.08: HighQoS ANTES de montar/mostrar a janela, senao o primeiro layout
+        // opening history cancels a paste queue that is running
+        _services?.GetRequiredService<PasteQueueService>().Cancel();
+        var latency = HotkeyLatency.Begin("historico");
+        // HighQoS ANTES de montar/mostrar a janela, senao o primeiro layout
         // e a composicao Mica rodam num efficient core e o painel abre devagar.
         PowerEfficiency.EnterProcessHighQos();
+        PowerEfficiency.SetProcessMemoryPriorityNormal();
+        _activityMonitor?.RecheckSoon();
         _pasteService?.CaptureForegroundTarget(_flyout.Hwnd);
         _flyout.ShowFlyout();
+        latency.End();
     }
 
     /// <summary>
-    /// RF-P2.09: retencao em timer de background (nao DispatcherTimer) e pulada
+    /// Retencao em timer de background (nao DispatcherTimer) e pulada
     /// enquanto houver jogo em tela cheia. A primeira execucao e adiada 60 s para
     /// nao disputar IO com o boot do Windows.
     /// </summary>
@@ -747,27 +1055,29 @@ public partial class App : Application
 
     private void RunRetentionOnce(SettingsService settings)
     {
-        // nao disputar CPU e IO com um jogo; o proximo tick pega
-        if (_activityMonitor?.State == SystemActivityState.Suspended || IsExiting)
+        // nao disputar CPU e IO com um jogo; o proximo tick pega. Avaliado aqui, na
+        // hora, ja que o monitor de atividade nao faz polling em repouso
+        if (IsExiting || SystemFullscreenDetector.Evaluate() == SystemActivityState.Suspended)
             return;
 
-        var repository = _host!.Services.GetRequiredService<ClipboardItemRepository>();
-        var mediaStore = _host.Services.GetRequiredService<MediaStore>();
-        var database = _host.Services.GetRequiredService<Database>();
-        // ADR-P.08: prioridade de CPU, IO e memoria baixas nesta varredura
+        var sp = _services!;
+        var repository = sp.GetRequiredService<ClipboardItemRepository>();
+        var mediaStore = sp.GetRequiredService<MediaStore>();
+        var database = sp.GetRequiredService<Database>();
+        // prioridade de CPU, IO e memoria baixas nesta varredura
         PowerEfficiency.RunAsBackgroundIo(() =>
         {
             try
             {
-                var orphans = repository.ApplyRetention(
-                    settings.Current.RetentionMaxItems,
-                    settings.Current.RetentionMaxAgeDays,
-                    settings.Current.RetentionMaxTotalBytes);
+                var s = settings.Current;
+                var orphans = repository.ApplyRetention(new RetentionLimits(
+                    s.RetentionMaxItems, s.RetentionMaxAgeDays, s.RetentionMaxTotalBytes,
+                    s.RetentionMaxImages, s.RetentionMaxMediaBytes));
                 mediaStore.DeleteFiles(orphans);
                 if (orphans.Count > 0)
                     StartupLog.Write($"Retencao: {orphans.Count} arquivo(s) removido(s)");
 
-                // RF-P2.07 / RF-P2.10: manutencao periodica junto da retencao, na mesma
+                // manutencao periodica junto da retencao, na mesma
                 // thread de background. PRAGMA optimize atualiza as estatisticas do
                 // planner, wal_checkpoint(TRUNCATE) impede o arquivo -wal crescer sem
                 // limite num app que fica dias ligado, e o optimize do FTS5 compacta os
@@ -784,17 +1094,18 @@ public partial class App : Application
 
     private void CreateTrayIcon()
     {
-        _tray = new TaskbarIcon
-        {
-            Icon = TrayIconFactory.Create(),
-            ToolTipText = "Klip",
-        };
+        _tray = new TaskbarIcon { ToolTipText = "Klip" };
+        RefreshTrayIcon();
         BuildTrayMenu();
+        // the taskbar color can change at runtime; the theme watcher of any open
+        // window raises this, and the menu/flyout paths check again (cheap reg read)
+        Wpf.Ui.Appearance.ApplicationThemeManager.Changed += (_, _) => RefreshTrayIcon();
         _tray.TrayLeftMouseUp += (_, _) =>
         {
             if (IsExiting)
                 return; // shutdown pumpeando o dispatcher: sem reentrancia via tray
-            // RF-F3.04: durante uma gravacao o clique no tray PARA a gravacao
+            RefreshTrayIcon();
+            // durante uma gravacao o clique no tray PARA a gravacao
             if (_recordingController?.IsActive == true)
                 _recordingController.RequestStop();
             else
@@ -806,7 +1117,12 @@ public partial class App : Application
         {
             if (IsExiting)
                 return;
-            if (_recordingToastFile is { } file)
+            if (DateTime.UtcNow - _takeoverToastUtc < TimeSpan.FromSeconds(30))
+            {
+                _takeoverToastUtc = DateTime.MinValue;
+                ShowMainWindow();
+            }
+            else if (_recordingToastFile is { } file)
             {
                 _recordingToastFile = null;
                 MediaEditorGateway.Open(file);
@@ -821,10 +1137,35 @@ public partial class App : Application
                 OpenEditor(lastCapture);
             }
         };
-        _tray.ForceCreate();
+        // ForceCreate() defaults to enablesEfficiencyMode: true, which puts the WHOLE
+        // process in EcoQoS and IDLE priority class (the Task Manager "efficiency mode").
+        // that is what left Klip at idle priority after startup: any normal load on the
+        // machine then took the cpu from the ui thread right when a hotkey came in
+        _tray.ForceCreate(enablesEfficiencyMode: false);
 
         // switching language rebuilds the menu right away
         Loc.LanguageChanged += BuildTrayMenu;
+    }
+
+    /// <summary>Swaps the tray .ico when the taskbar switched between light and dark.</summary>
+    private void RefreshTrayIcon()
+    {
+        if (_tray is null)
+            return;
+        try
+        {
+            var light = TrayIconFactory.TaskbarIsLight();
+            if (_trayIconLight == light)
+                return;
+            _trayIconLight = light;
+            var old = _tray.Icon;
+            _tray.Icon = TrayIconFactory.Create(light);
+            old?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            StartupLog.WriteException("TrayIcon", ex);
+        }
     }
 
     private void BuildTrayMenu()
@@ -833,30 +1174,73 @@ public partial class App : Application
             return;
 
         var menu = new ContextMenu();
+        menu.Opened += (_, _) => RefreshTrayIcon();
         menu.Items.Add(CreateMenuItem(Loc.TrayOpenHistory, "\uE81C", (_, _) => ToggleHistoryFlyout()));
         menu.Items.Add(CreateMenuItem(Loc.TrayCapture, "\uE722", (_, _) => StartCapture()));
+        menu.Items.Add(CreateMenuItem(Loc.TrayRepeatRegion, "\uE72C", (_, _) => RepeatLastRegion()));
+        menu.Items.Add(CreateMenuItem(Loc.TrayMediaEditor, "\uE714", (_, _) => OpenMediaEditorEmpty()));
+        menu.Items.Add(BuildPinnedMenuItem());
         menu.Items.Add(CreateMenuItem(Loc.TraySettings, "\uE713", (_, _) => ShowMainWindow()));
         menu.Items.Add(new Separator());
 
-        // pause/resume on a single click (no checkbox), last item before Exit;
-        // the state shows up in the text and glyph themselves
-        var paused = _clipboardMonitor?.IsPaused == true;
-        var pauseItem = CreateMenuItem(paused ? Loc.TrayResumeHistory : Loc.TrayPauseHistory,
-            paused ? "\uE768" : "\uE769", (_, _) => { });
+        // pause (15 min, 1 h, until resumed) and ignore the next copy. While paused the
+        // submenu gives way to a single "resume" item
+        var pause = _services?.GetService<HistoryPause>();
+        var pauseItem = CreateMenuItem(Loc.TrayPauseHistory, "", (_, _) => { });
         pauseItem.ToolTip = Loc.TrayPauseTooltip;
-        pauseItem.Click += (_, _) =>
+        pauseItem.Items.Add(CreateMenuItem(Loc.TrayPause15, "", (_, _) => pause?.Pause(TimeSpan.FromMinutes(15))));
+        pauseItem.Items.Add(CreateMenuItem(Loc.TrayPause60, "", (_, _) => pause?.Pause(TimeSpan.FromHours(1))));
+        pauseItem.Items.Add(CreateMenuItem(Loc.TrayPauseUntil, "", (_, _) => pause?.Pause(null)));
+        var resumeItem = CreateMenuItem(Loc.TrayResumeHistory, "", (_, _) => pause?.Resume());
+        var ignoreItem = CreateMenuItem(Loc.TrayIgnoreNext, "", (_, _) =>
         {
-            if (_clipboardMonitor is null)
+            if (pause is null)
                 return;
-            _clipboardMonitor.IsPaused = !_clipboardMonitor.IsPaused;
-            pauseItem.Header = _clipboardMonitor.IsPaused ? Loc.TrayResumeHistory : Loc.TrayPauseHistory;
-            ((TextBlock)pauseItem.Icon).Text = _clipboardMonitor.IsPaused ? "\uE768" : "\uE769";
+            if (pause.IsIgnoringNext)
+                pause.CancelIgnoreNext();
+            else
+                pause.IgnoreNext();
+        });
+        menu.Opened += (_, _) =>
+        {
+            var paused = pause?.IsPaused == true;
+            pauseItem.Visibility = paused ? Visibility.Collapsed : Visibility.Visible;
+            resumeItem.Visibility = paused ? Visibility.Visible : Visibility.Collapsed;
+            ((TextBlock)ignoreItem.Icon).Text = pause?.IsIgnoringNext == true ? "" : "";
         };
         menu.Items.Add(pauseItem);
+        menu.Items.Add(resumeItem);
+        menu.Items.Add(ignoreItem);
 
         menu.Items.Add(CreateMenuItem(Loc.TrayExit, "\uE7E8", (_, _) => ExitApplication()));
 
         _tray.ContextMenu = menu;
+    }
+
+    private MenuItem? _pinnedMenuItem;
+    private bool _pinnedHooked;
+
+    /// <summary>"Pinned images" submenu, only visible while something is pinned.</summary>
+    private MenuItem BuildPinnedMenuItem()
+    {
+        var pinned = _services!.GetRequiredService<PinnedImageService>();
+        var item = CreateMenuItem(Loc.TrayPinnedImages, "\uE718", (_, _) => { });
+        item.Items.Add(CreateMenuItem(Loc.TrayPinnedCloseAll, "\uE711", (_, _) => pinned.CloseAll()));
+        item.Items.Add(CreateMenuItem(Loc.TrayPinnedStopClickThrough, "\uE7C9", (_, _) => pinned.StopClickThrough()));
+        item.Visibility = pinned.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        _pinnedMenuItem = item;
+
+        // hooked once: the menu is rebuilt on language changes, the service is not
+        if (!_pinnedHooked)
+        {
+            _pinnedHooked = true;
+            pinned.Changed += () => Dispatcher.BeginInvoke(() =>
+            {
+                if (_pinnedMenuItem is not null)
+                    _pinnedMenuItem.Visibility = pinned.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            });
+        }
+        return item;
     }
 
     private static MenuItem CreateMenuItem(string header, string glyph, RoutedEventHandler onClick)
@@ -876,20 +1260,20 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// ADR-S.01: cria a janela de Configuracoes sob demanda. O shell so monta a si
-    /// mesmo e a pagina ativa (ADR-S.03: as outras 6 nascem na primeira navegacao),
+    /// Cria a janela de Configuracoes sob demanda. O shell so monta a si
+    /// mesmo e a pagina ativa (as outras nascem na primeira navegacao),
     /// entao o custo e uma fracao da tela monolitica anterior.
     /// </summary>
     private void ShowMainWindow()
     {
-        if (_host is null || IsExiting)
+        if (_services is null || IsExiting)
             return;
-        // ADR-P.08: sai do Eco antes de montar/mostrar (senao o layout roda em E-core)
+        // sai do Eco antes de montar/mostrar (senao o layout roda em E-core)
         PowerEfficiency.EnterProcessHighQos();
 
         if (_settingsWindow is null)
         {
-            _settingsWindow = _host.Services.GetRequiredService<SettingsShell>();
+            _settingsWindow = _services.GetRequiredService<SettingsShell>();
             _settingsWindow.IsVisibleChanged += (_, _) => ApplyIdleQosIfNoWindowVisible();
             StartupLog.Write("Configuracoes: janela criada sob demanda");
         }
@@ -903,10 +1287,354 @@ public partial class App : Application
 
     private void NotifyHotkeyConflict(HotkeyGesture gesture)
     {
+        var error = _services?.GetService<HotkeyService>()?.LastError ?? 0;
+        StartupLog.Write($"Atalho {gesture}: RegisterHotKey falhou (erro {error})");
+        // once per gesture per session: the retries below would otherwise repeat it on every unlock
+        if (_quietHotkeyRetry || !_conflictNotified.Add(gesture.ToString()))
+            return;
         _tray?.ShowNotification("Klip", string.Format(Loc.NotifyHotkeyConflict, gesture));
     }
 
-    // RF-F3.16: finalizacao graciosa no encerramento do app - o Sair do tray
+    /// <summary>
+    /// A Windows update can put PrintScreen back on the snipping tool or drop a letter
+    /// from DisabledHotkeys. RegisterHotKey still succeeds, but the key opens the system
+    /// tool. Reads the registry off the ui thread and warns once per key per session;
+    /// it never writes (taking it back is the user's call in the settings).
+    /// </summary>
+    private void CheckTakeover(string reason)
+    {
+        if (IsExiting || _services is null)
+            return;
+        var current = _services.GetRequiredService<SettingsService>().Current;
+        var configured = new List<HotkeyGesture>();
+        foreach (var text in new[] { current.HotkeyHistory, current.HotkeyCapture, current.HotkeyCaptureText,
+                     current.HotkeyRepeatRegion, current.HotkeyRecordVideo,
+                     current.HotkeyCaptureRectangle })
+        {
+            if (HotkeyGesture.TryParse(text, out var g))
+                configured.Add(g);
+        }
+        // nothing configured depends on a registry takeover: no need to read it
+        if (TakeoverCheck.Lost(configured, false, false, false).Count == 0)
+            return;
+
+        var registry = _services.GetRequiredService<SystemHotkeyService>();
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var state = registry.GetState();
+                var lost = TakeoverCheck.Lost(configured,
+                    state.WinVFreed || state.HklmClipboardFeatureOff, state.WinSFreed, state.PrintScreenFreed);
+                if (lost.Count == 0)
+                    return;
+                StartupLog.Write($"Atalhos: takeover perdido ({reason}): {string.Join(", ", lost)}");
+                Dispatcher.BeginInvoke(() =>
+                {
+                    var fresh = lost.Where(_takeoverLostNotified.Add).ToList();
+                    if (fresh.Count == 0 || IsExiting)
+                        return;
+                    _takeoverToastUtc = DateTime.UtcNow;
+                    _tray?.ShowNotification("Klip", string.Format(Loc.NotifyTakeoverLost, string.Join(", ", fresh)));
+                });
+            }
+            catch (Exception ex)
+            {
+                StartupLog.WriteException("CheckTakeover", ex);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Registers again when some hotkey failed earlier (another app held it, Explorer
+    /// was restarting). Called on resume, unlock and when the taskbar comes back.
+    /// </summary>
+    private void RetryFailedHotkeys(string reason)
+    {
+        if (!_hotkeysIncomplete || IsExiting || _services is null)
+            return;
+        _quietHotkeyRetry = true;
+        try
+        {
+            var ok = ApplyHotkeys(_services.GetRequiredService<SettingsService>());
+            StartupLog.Write($"Atalhos: nova tentativa ({reason}) {(ok ? "registrou todos" : "ainda falta algum")}");
+        }
+        finally
+        {
+            _quietHotkeyRetry = false;
+        }
+    }
+
+    /// <summary>
+    /// Warm-ups that used to sit in the startup path, now at idle: the flyout first
+    /// (first Win+V), then the LL hook thread, then a few seconds later the capture
+    /// path (GDI/WIC/JIT cost ~300 ms on the first Win+Shift+S after boot).
+    /// </summary>
+    private void WarmUpAtIdle()
+    {
+        // warm up the flyout at idle so the first Win+V opens instantly (pre-pays
+        // the first layout and the Mica composition without the user seeing it)
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            _flyout?.WarmUp();
+            try
+            {
+                LowLevelHookHost.Shared.Start();
+            }
+            catch (Exception ex)
+            {
+                StartupLog.WriteException("HookHostStart", ex);
+            }
+        }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+
+        var captureWarm = new System.Windows.Threading.DispatcherTimer(
+            System.Windows.Threading.DispatcherPriority.ApplicationIdle, Dispatcher)
+        {
+            Interval = TimeSpan.FromSeconds(5),
+        };
+        captureWarm.Tick += (_, _) =>
+        {
+            captureWarm.Stop(); // one shot
+            if (!IsExiting)
+                _captureController?.WarmUp();
+        };
+        captureWarm.Start();
+    }
+
+    /// <summary>
+    /// Resume from sleep/modern standby: the whole process was frozen, and whatever
+    /// the warm-ups paid for is gone or uncertain by the time it thaws. A small delay
+    /// before re-warming because the display/GPU driver is often still settling right
+    /// at the resume event itself.
+    /// </summary>
+    private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == PowerModes.Suspend)
+        {
+            Dispatcher.BeginInvoke(() => _idleRecycler?.OnSuspend());
+            return;
+        }
+        if (e.Mode != PowerModes.Resume)
+            return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            StartupLog.WriteVerbose("Energia: resume detectado");
+            RewarmSoon();
+            _idleRecycler?.OnResume();
+            RecoverAfterAway("resume");
+        });
+    }
+
+    /// <summary>
+    /// Lock/unlock, remote session and display changes. Before, only sleep was handled,
+    /// and "it got slow after I locked the screen" had nothing listening for it.
+    /// </summary>
+    private void WatchSessionEvents()
+    {
+        SystemEvents.SessionSwitch += OnSessionSwitch;
+        SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+
+        _taskbarCreatedMessage = NativeMethods.RegisterWindowMessage("TaskbarCreated");
+        _broadcastWindow = new System.Windows.Interop.HwndSource(
+            new System.Windows.Interop.HwndSourceParameters("KlipBroadcastWindow")
+            {
+                WindowStyle = 0, // WS_OVERLAPPED, never shown
+                Width = 0,
+                Height = 0,
+            });
+        _broadcastWindow.AddHook(BroadcastWndProc);
+    }
+
+    private nint BroadcastWndProc(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
+    {
+        // Explorer came back (crash, restart, the takeover flow): it reads DisabledHotkeys
+        // again and a hotkey it held during the restart may now be free for us
+        if (_taskbarCreatedMessage != 0 && (uint)msg == _taskbarCreatedMessage)
+        {
+            StartupLog.Write("Sessao: Explorer reiniciado (TaskbarCreated)");
+            Dispatcher.BeginInvoke(() =>
+            {
+                RetryFailedHotkeys("Explorer");
+                CheckTakeover("Explorer");
+            });
+        }
+        return nint.Zero;
+    }
+
+    private void OnSessionSwitch(object? sender, SessionSwitchEventArgs e)
+    {
+        // runs on the SystemEvents thread: only hand over to the dispatcher
+        var reason = e.Reason switch
+        {
+            SessionSwitchReason.SessionUnlock => "desbloqueio",
+            SessionSwitchReason.ConsoleConnect => "console conectado",
+            SessionSwitchReason.RemoteConnect => "sessao remota",
+            SessionSwitchReason.SessionLogon => "logon",
+            _ => null,
+        };
+        if (e.Reason is SessionSwitchReason.SessionLock)
+            StartupLog.Write("Sessao: tela bloqueada");
+        if (reason is null)
+            return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            StartupLog.Write($"Sessao: {reason}");
+            RewarmSoon();
+            RecoverAfterAway(reason);
+        });
+    }
+
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            StartupLog.Write($"Sessao: monitores mudaram ({NativeMethods.GetMonitors().Count} agora)");
+            RewarmSoon();
+        });
+    }
+
+    /// <summary>
+    /// What to check when the user comes back (resume, unlock, remote connect): the
+    /// fullscreen state may be stale, a hotkey may be free again, the takeover may have
+    /// been undone by an update, and the clipboard listener may have gone deaf.
+    /// </summary>
+    private void RecoverAfterAway(string reason)
+    {
+        if (IsExiting)
+            return;
+        _activityMonitor?.RecheckSoon();
+        RetryFailedHotkeys(reason);
+        CheckTakeover(reason);
+        _clipboardMonitor?.CheckListener(reason);
+    }
+
+    /// <summary>Anything going on that a recycle would cut short.</summary>
+    private bool IsBusyForRecycle()
+    {
+        if (IsExiting || _recordingController?.IsActive == true)
+            return true;
+        // a game or fullscreen app has the machine: starting a whole wpf process now
+        // would steal from it, and the recycle can wait for the next stretch
+        if (_activityMonitor?.State == SystemActivityState.Suspended)
+            return true;
+        if (_services?.GetService<PasteQueueService>()?.IsArmed == true)
+            return true;
+        foreach (Window window in Windows)
+        {
+            if (window.IsVisible)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Starts a fresh instance and leaves. The new one waits for this process to exit
+    /// before taking the single instance mutex, then reads the clipboard once if it
+    /// changed in between. If the new process can't be started, this one just stays.
+    /// </summary>
+    private void RecycleProcess(string reason)
+    {
+        if (IsExiting || Environment.ProcessPath is not { } exe)
+            return;
+        try
+        {
+            var startInfo = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false };
+            var sequence = _clipboardMonitor?.LastProcessedSequence ?? 0;
+            foreach (var arg in IdleRecycle.BuildArgs(Environment.ProcessId, sequence, StartupLog.VerboseEnabled))
+                startInfo.ArgumentList.Add(arg);
+            StartupLog.Write($"Reciclagem: {reason}, trocando por um processo novo");
+            System.Diagnostics.Process.Start(startInfo)?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            StartupLog.WriteException("Reciclagem", ex);
+            return;
+        }
+        _recycling = true;
+        ExitApplication();
+    }
+
+    private static void WaitForProcessExit(int pid, TimeSpan timeout)
+    {
+        try
+        {
+            using var old = System.Diagnostics.Process.GetProcessById(pid);
+            old.WaitForExit(timeout);
+        }
+        catch (ArgumentException)
+        {
+            // already gone
+        }
+        catch (Exception ex)
+        {
+            StartupLog.WriteException("ReciclagemEspera", ex);
+        }
+    }
+
+    /// <summary>
+    /// Re-pays the flyout and capture warm-ups a few seconds after a sleep/resume cycle
+    /// may have undone them. Skipped if a window is already open - there's nothing to
+    /// warm and showing one would be a visible glitch.
+    /// </summary>
+    private void RewarmSoon()
+    {
+        if (IsExiting)
+            return;
+        // Background, not ApplicationIdle: the latter only runs once the dispatcher
+        // queue is truly empty, and a fullscreen game (or just normal clipboard/hook
+        // traffic) can keep that from ever happening for hours - which is exactly how
+        // this recovery step itself went silent for 9+ hours in one real session.
+        var timer = new System.Windows.Threading.DispatcherTimer(
+            System.Windows.Threading.DispatcherPriority.Background, Dispatcher)
+        {
+            Interval = TimeSpan.FromSeconds(3),
+        };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            if (IsExiting)
+                return;
+            _flyout?.Rewarm();
+            _captureController?.WarmUp();
+        };
+        timer.Start();
+    }
+
+    /// <summary>
+    /// First hook scope opened / last one closed. The watchdog and the fullscreen
+    /// poller only make sense while a hook is installed; at idle both are stopped.
+    /// </summary>
+    private void OnHookScopeActiveChanged(bool active)
+    {
+        if (IsExiting)
+            return;
+        if (active)
+        {
+            _uiWatchdog?.Start();
+            _activityMonitor?.Start();
+            return;
+        }
+        if (!StartupLog.VerboseEnabled)
+            _uiWatchdog?.Stop();
+        _activityMonitor?.Stop();
+    }
+
+    private void PurgePendingSecrets()
+    {
+        try
+        {
+            var ingest = _services?.GetService<ClipboardIngestService>();
+            var wiped = ingest?.Secrets.PurgeAll() ?? 0;
+            if (wiped > 0)
+                StartupLog.Write($"Segredos: {wiped} apagado(s) ao sair");
+        }
+        catch (Exception ex)
+        {
+            StartupLog.WriteException("PurgeSecrets", ex);
+        }
+    }
+
+    // finalizacao graciosa no encerramento do app - o Sair do tray
     // para a gravacao ativa e espera a finalizacao (MP4 com teto de 30 s; GIF
     // ate o fim do encode) antes do shutdown; a janela "Finalizando
     // gravacao..." do proprio StopAsync fica visivel enquanto isso
@@ -944,7 +1672,7 @@ public partial class App : Application
     private bool _recordingFinalizeHandled;
 
     /// <summary>
-    /// RF-F3.16: shutdown/logoff do Windows nao espera awaits da UI - melhor
+    /// Shutdown/logoff do Windows nao espera awaits da UI - melhor
     /// esforco sincrono com timeout curto (5 s), bombeando o dispatcher via
     /// DispatcherFrame para as continuations da finalizacao rodarem sem
     /// deadlock na UI thread. MP4 preserva o ja fragmentado; GIF pode perder
@@ -958,12 +1686,13 @@ public partial class App : Application
             _recordingFinalizeHandled = true;
             PumpRecordingFinalize(TimeSpan.FromSeconds(5));
         }
-        // RF-P3.05 / RF-P3.06: shutdown do Windows nao espera - persiste o pendente agora
-        _host?.Services.GetService<SettingsService>()?.Flush();
+        // shutdown do Windows nao espera - persiste o pendente agora
+        _services?.GetService<SettingsService>()?.Flush();
+        PurgePendingSecrets();
         StartupLog.Flush();
     }
 
-    /// <summary>Espera a finalizacao da gravacao sem bloquear o dispatcher (RF-F3.16).</summary>
+    /// <summary>Espera a finalizacao da gravacao sem bloquear o dispatcher.</summary>
     private void PumpRecordingFinalize(TimeSpan timeout)
     {
         if (_recordingController is not { } controller)
@@ -976,7 +1705,7 @@ public partial class App : Application
             IsExiting = true;
             try
             {
-                var hotkeys = _host?.Services.GetService<HotkeyService>();
+                var hotkeys = _services?.GetService<HotkeyService>();
                 if (hotkeys is not null)
                 {
                     if (_historyHotkeyId != 0)
@@ -989,6 +1718,9 @@ public partial class App : Application
                         hotkeys.Unregister(_captureHotkeyId);
                         _captureHotkeyId = 0;
                     }
+                    foreach (var id in _optionalHotkeyIds)
+                        hotkeys.Unregister(id);
+                    _optionalHotkeyIds.Clear();
                 }
                 if (_tray is not null)
                     _tray.ContextMenu = null; // cliques guardados por IsExiting
@@ -1028,7 +1760,7 @@ public partial class App : Application
         if (_recordingController is { } pending && pending.IsActive && !pending.IsBusy)
             pending.RequestStop();
 
-        // RF-F3.16: rede de seguranca para saidas que nao passaram pelo
+        // rede de seguranca para saidas que nao passaram pelo
         // ExitApplication (ex.: Shutdown() direto) - mesmo melhor esforco
         // do SessionEnding, com o teto de 30 s do fluxo normal
         if (_recordingController?.IsBusy == true && !_recordingFinalizeHandled)
@@ -1039,25 +1771,36 @@ public partial class App : Application
 
         _tray?.Dispose();
 
-        // RF-P1.06 / RF-P0.02: parar antes de derrubar o host
+        // stop the timers before the container goes away
+        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        // static events: a handler left here keeps the app alive and fires during shutdown
+        SystemEvents.SessionSwitch -= OnSessionSwitch;
+        SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+        _broadcastWindow?.Dispose();
+        LowLevelHookHost.Shared.ScopeActiveChanged -= OnHookScopeActiveChanged;
         _retentionTimer?.Dispose();
         _activityMonitor?.Dispose();
         _uiWatchdog?.Dispose();
+        _memory?.Dispose();
+        _idleRecycler?.Dispose();
 
         _clipboardMonitor?.Dispose();
-        if (_host is not null)
+        PurgePendingSecrets();
+        if (_services is not null)
         {
             // limpa o historico ao sair (mantem os fixados/favoritos)
             try
             {
-                var settings = _host.Services.GetService<SettingsService>();
-                if (settings?.Current.ClearHistoryOnExit == true)
+                var settings = _services.GetService<SettingsService>();
+                // a recycle is not the user leaving: the history stays
+                if (settings?.Current.ClearHistoryOnExit == true && !_recycling)
                 {
-                    var repo = _host.Services.GetService<ClipboardItemRepository>();
+                    var repo = _services.GetService<ClipboardItemRepository>();
                     repo?.ClearAll();
-                    repo?.Vacuum();
+                    // incremental: gives the pages back without rewriting the whole file on exit
+                    repo?.ReclaimSpace();
                 }
-                // RF-P3.06: grava o que o debounce ainda nao persistiu
+                // grava o que o debounce ainda nao persistiu
                 settings?.Flush();
             }
             catch (Exception ex)
@@ -1065,20 +1808,21 @@ public partial class App : Application
                 StartupLog.WriteException("ClearOnExit", ex);
             }
 
-            _host.Services.GetService<PasteQueueService>()?.Dispose();
-            _host.Services.GetService<HotkeyService>()?.Dispose();
-            // ADR-P.05: a thread do clipboard vai DEPOIS do monitor, que precisa dela
+            _services.GetService<PasteQueueService>()?.Dispose();
+            _services.GetService<HotkeyService>()?.Dispose();
+            _services.GetService<ExplorerPasteService>()?.Dispose();
+            // a thread do clipboard vai DEPOIS do monitor, que precisa dela
             // viva para remover o listener na mesma thread que o registrou.
-            _host.Services.GetService<ClipboardThread>()?.Dispose();
-            _host.Services.GetService<Database>()?.Dispose();
-            _host.Dispose();
+            _services.GetService<ClipboardThread>()?.Dispose();
+            _services.GetService<Database>()?.Dispose();
+            _services.Dispose();
         }
-        // ADR-P.01: derruba o pump e o worker dos hooks LL
+        // derruba o pump e o worker dos hooks LL
         LowLevelHookHost.Shared.Dispose();
         _mutex?.Dispose();
         base.OnExit(e);
 
-        // RF-P3.05: por ultimo - qualquer Write depois disso cai no append sincrono
+        // por ultimo - qualquer Write depois disso cai no append sincrono
         StartupLog.Flush();
         StartupLog.Shutdown();
     }

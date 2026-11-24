@@ -86,70 +86,51 @@ public static partial class NativeMethods
         };
     }
 
-    /// <summary>Releases modifiers that are physically held down before we synthesize input.</summary>
-    public static void ReleasePressedModifiers()
-    {
-        ushort[] modifiers = [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN];
-        var toRelease = modifiers
-            .Where(vk => (GetAsyncKeyState(vk) & 0x8000) != 0)
-            .Select(vk => KeyInput(vk, up: true))
-            .ToArray();
-        if (toRelease.Length > 0)
-            SendInput((uint)toRelease.Length, toRelease, Marshal.SizeOf<INPUT>());
-    }
-
-    /// <summary>Synthesizes Ctrl+V.</summary>
-    public static void SendCtrlV()
-    {
-        INPUT[] inputs =
-        [
-            KeyInput(VK_CONTROL, up: false),
-            KeyInput(VK_V, up: false),
-            KeyInput(VK_V, up: true),
-            KeyInput(VK_CONTROL, up: true),
-        ];
-        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
-    }
-
     public const uint KEYEVENTF_UNICODE = 0x0004;
     public const ushort VK_RETURN = 0x0D;
     public const ushort VK_TAB = 0x09;
 
     /// <summary>
-    /// Types the text as keystrokes (KEYEVENTF_UNICODE) instead of going through
-    /// the clipboard. Works in fields that block paste (password boxes, sites
-    /// with onpaste blocked) and in remote sessions like TeamViewer/RDP that do
-    /// not forward a synthetic Ctrl+V. Newlines become Enter, tabs become Tab.
-    /// Sent in small chunks so slow targets don't drop characters.
+    /// Types the text as keystrokes (KEYEVENTF_UNICODE) instead of going through the
+    /// clipboard. Works in fields that block paste (password boxes, sites with onpaste
+    /// blocked) and in remote sessions like TeamViewer or RDP that do not forward a
+    /// synthetic Ctrl+V. Newlines become Enter, tabs become Tab. Sent two characters at a
+    /// time at about a hundred and thirty a second: it reads like typing instead of
+    /// stuttering bursts, and an app can keep up. Much faster and its input queue piles
+    /// up and it freezes, and stopping late does not help because what is already
+    /// queued still arrives.
+    /// <para>
+    /// <paramref name="cancel"/> is asked before every chunk; when it says yes the rest
+    /// is dropped and this returns false. True means everything was typed.
+    /// </para>
     /// </summary>
-    public static void SendUnicodeText(string text, int chunkSize = 32, int chunkDelayMs = 10)
+    public static bool SendUnicodeText(string text, Func<bool>? cancel = null, int chunkSize = 2, int chunkDelayMs = 15)
     {
         var inputs = new List<INPUT>(Math.Min(text.Length, chunkSize) * 2);
         var size = Marshal.SizeOf<INPUT>();
         var charsInChunk = 0;
 
-        void Flush()
+        bool Flush()
         {
             if (inputs.Count == 0)
-                return;
+                return true;
+            if (cancel?.Invoke() == true)
+                return false;
             SendInput((uint)inputs.Count, [.. inputs], size);
             inputs.Clear();
             charsInChunk = 0;
             Thread.Sleep(chunkDelayMs);
+            return true;
         }
 
         for (var i = 0; i < text.Length; i++)
         {
             var c = text[i];
-            if (c == '\r')
+            if (c == '\r' || c == '\n')
             {
-                if (i + 1 < text.Length && text[i + 1] == '\n')
+                // \r\n is one Enter
+                if (c == '\r' && i + 1 < text.Length && text[i + 1] == '\n')
                     i++;
-                inputs.Add(KeyInput(VK_RETURN, up: false));
-                inputs.Add(KeyInput(VK_RETURN, up: true));
-            }
-            else if (c == '\n')
-            {
                 inputs.Add(KeyInput(VK_RETURN, up: false));
                 inputs.Add(KeyInput(VK_RETURN, up: true));
             }
@@ -165,10 +146,10 @@ public static partial class NativeMethods
                 inputs.Add(UnicodeInput(c, up: true));
             }
 
-            if (++charsInChunk >= chunkSize)
-                Flush();
+            if (++charsInChunk >= chunkSize && !Flush())
+                return false;
         }
-        Flush();
+        return Flush();
     }
 
     private static INPUT UnicodeInput(char c, bool up) => new()
@@ -184,6 +165,42 @@ public static partial class NativeMethods
             },
         },
     };
+
+    /// <summary>Releases modifiers that are physically held down before we synthesize input.</summary>
+    public static void ReleasePressedModifiers()
+    {
+        ushort[] modifiers = [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN];
+        var toRelease = modifiers
+            .Where(vk => (GetAsyncKeyState(vk) & 0x8000) != 0)
+            .Select(vk => KeyInput(vk, up: true))
+            .ToArray();
+        if (toRelease.Length > 0)
+            SendInput((uint)toRelease.Length, toRelease, Marshal.SizeOf<INPUT>());
+    }
+
+    /// <summary>
+    /// Taps an unassigned key (0xE8). Sent while the user holds Alt after we swallowed
+    /// Alt+digit: without it the app below sees a lone Alt press and opens its menu bar.
+    /// </summary>
+    public static void SendMaskKey()
+    {
+        const ushort VK_MASK = 0xE8;
+        INPUT[] inputs = [KeyInput(VK_MASK, up: false), KeyInput(VK_MASK, up: true)];
+        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+    }
+
+    /// <summary>Synthesizes Ctrl+V.</summary>
+    public static void SendCtrlV()
+    {
+        INPUT[] inputs =
+        [
+            KeyInput(VK_CONTROL, up: false),
+            KeyInput(VK_V, up: false),
+            KeyInput(VK_V, up: true),
+            KeyInput(VK_CONTROL, up: true),
+        ];
+        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+    }
 
     // ----- Synthetic scroll -----
 

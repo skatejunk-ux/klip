@@ -48,7 +48,7 @@ public class SettingsServiceTests : IDisposable
             s.HotkeyHistory = "Win+V";
             s.RetentionMaxItems = 42;
         });
-        service.Flush(); // RF-P3.06: Update so agenda; o disco espera o debounce
+        service.Flush(); // Update so agenda; o disco espera o debounce
 
         using var reloaded = new SettingsService(_path);
         Assert.Equal("Win+V", reloaded.Current.HotkeyHistory);
@@ -77,7 +77,7 @@ public class SettingsServiceTests : IDisposable
     [Fact]
     public void UpdateAndFlush_PersistsWithoutWaitingForDebounce()
     {
-        // RF-P3.06: caminho usado pelo takeover de registro, onde o backup
+        // caminho usado pelo takeover de registro, onde o backup
         // precisa estar em disco antes de mexer nas chaves
         using var service = new SettingsService(_path);
         service.UpdateAndFlush(s =>
@@ -186,7 +186,7 @@ public class EditorPreferencesTests : IDisposable
         using var service = new SettingsService(_path);
         Assert.Equal(1.0, service.Current.EditorZoom);
         Assert.Equal(1, service.Current.EditorActiveTool); // Pen
-        Assert.Equal("#FF4040", service.Current.EditorActiveColor); // Red
+        Assert.Equal("#FF8787", service.Current.EditorActiveColor); // first (red) swatch
         Assert.Equal(3.0, service.Current.EditorThickness);
     }
 
